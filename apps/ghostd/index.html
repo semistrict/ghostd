@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ghostd</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #101216;
+        overflow: hidden;
+      }
+
+      #terminal {
+        width: 100vw;
+        height: calc(100dvh - 28px);
+        border-radius: 0;
+        box-shadow: none;
+      }
+
+      #status-bar {
+        height: 28px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 12px;
+        color: #c9d1d9;
+        background: #1b1f26;
+        border-bottom: 1px solid #2d333b;
+        font:
+          12px/1.2 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+      }
+
+      #claim-writer {
+        height: 22px;
+        padding: 0 9px;
+        border: 1px solid #46515f;
+        border-radius: 4px;
+        color: #dbe7f3;
+        background: #26313d;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      #claim-writer:hover {
+        background: #314052;
+      }
+
+      #claim-writer:active {
+        background: #1f2934;
+      }
+
+      #claim-writer[hidden] {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status-bar">
+      <span>role: <span id="status">reader</span></span>
+      <button id="claim-writer" type="button">steal write</button>
+    </div>
+    <div id="terminal"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

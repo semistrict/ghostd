@@ -111,6 +111,18 @@ describe("Renderer", () => {
       expect(span?.getAttribute("style")).toContain("color:");
     });
 
+    it("does not paint the grid container from the bottom-right cell", () => {
+      const grid = [
+        [makeCell(" ", 256, 256), makeCell(" ", 256, 256)],
+        [makeCell(" ", 256, 2), makeCell(" ", 256, 2)],
+      ];
+      const bridge = createMockBridge(2, 2, grid);
+      const renderer = new Renderer(container);
+      renderer.render(bridge as any);
+
+      expect(container.style.background).toBe("");
+    });
+
     it("applies bold style via flags", () => {
       const FLAG_BOLD = 0x01;
       const grid = [[makeCell("B", 256, 256, FLAG_BOLD)]];

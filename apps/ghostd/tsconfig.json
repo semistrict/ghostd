@@ -1,0 +1,7 @@
+{
+  "extends": "@internal/ts/tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node", "vite/client"]
+  },
+  "include": ["src", "vite.config.ts", "vite-plugins", "wterm-dom.d.ts"]
+}

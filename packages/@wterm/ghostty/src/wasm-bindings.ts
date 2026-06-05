@@ -67,6 +67,24 @@ const CELL_BYTES = 16;
 const DEFAULT_WASM_PATH = new URL("../wasm/ghostty-vt.wasm", import.meta.url)
   .href;
 
+async function loadWasmBytes(url: string): Promise<ArrayBuffer> {
+  if (url.startsWith("file:")) {
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const bytes = await readFile(fileURLToPath(url));
+    return bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
+  }
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to load ghostty WASM: ${response.statusText}`);
+  }
+  return response.arrayBuffer();
+}
+
 /**
  * Load the ghostty-vt WASM module.
  *
@@ -75,8 +93,7 @@ const DEFAULT_WASM_PATH = new URL("../wasm/ghostty-vt.wasm", import.meta.url)
  */
 export async function loadGhosttyWasm(wasmUrl?: string): Promise<GhosttyWasm> {
   const url = wasmUrl ?? DEFAULT_WASM_PATH;
-  const response = await fetch(url);
-  const bytes = await response.arrayBuffer();
+  const bytes = await loadWasmBytes(url);
 
   let wasmMemory: WebAssembly.Memory;
 

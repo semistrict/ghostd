@@ -168,15 +168,16 @@ export fn get_viewport(ptr: usize, buf_ptr: [*]u8) u32 {
                 continue;
             }
             const raw = raw_cells[x];
-            const style = style_cells[x];
+            const has_style = raw.style_id > 0;
+            const style: Style = if (has_style) style_cells[x] else .{};
 
             const cp: u32 = switch (raw.content_tag) {
                 .codepoint, .codepoint_grapheme => raw.content.codepoint,
                 else => 0,
             };
 
-            const has_fg = style.fg_color != .none;
-            const has_bg_style = style.bg_color != .none;
+            const has_fg = has_style and style.fg_color != .none;
+            const has_bg_style = has_style and style.bg_color != .none;
             const has_bg_cell = raw.content_tag == .bg_color_palette or raw.content_tag == .bg_color_rgb;
             const has_bg = has_bg_style or has_bg_cell;
 
@@ -333,4 +334,3 @@ export fn free_buffer(buf_ptr: usize, len: u32) void {
     const slice: [*]u8 = @ptrFromInt(buf_ptr);
     allocator.free(slice[0..len]);
 }
-

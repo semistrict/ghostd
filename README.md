@@ -78,6 +78,14 @@ cp web/wterm.wasm examples/nextjs/public/
 pnpm --filter nextjs dev
 ```
 
+### Run ghostd
+
+This builds the browser client and starts one native Ghostty-backed terminal daemon. Browser refreshes and multiple clients attach to the same session over MessagePack WebSocket frames.
+
+```bash
+pnpm --filter ghostd dev
+```
+
 ### Run Zig tests
 
 ```bash
