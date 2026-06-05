@@ -22,7 +22,7 @@
     "build": "tsc",
     "prepublishOnly": "pnpm build",
     "test": "vitest run",
-    "type-check": "tsc --noEmit"
+    "type-check": "pnpm prebuild && tsc --noEmit"
   },
   "devDependencies": {
     "@internal/ts": "workspace:*",

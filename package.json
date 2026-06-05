@@ -10,7 +10,8 @@
     "dev": "pnpm --filter ghostd dev",
     "build": "pnpm --filter ghostd build",
     "type-check": "pnpm --filter @wterm/core type-check && pnpm --filter @wterm/dom type-check && pnpm --filter ghostd type-check",
-    "test": "pnpm --filter @wterm/dom test && pnpm --filter ghostd native:test"
+    "test": "pnpm --filter @wterm/core build && pnpm --filter @wterm/dom test && pnpm --filter ghostd native:test && pnpm --filter ghostd e2e",
+    "e2e": "pnpm --filter ghostd e2e"
   },
   "packageManager": "pnpm@11.1.3"
 }

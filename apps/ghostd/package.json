@@ -10,6 +10,7 @@
     "native:build": "sh scripts/zig-015.sh build --build-file native/build.zig --cache-dir native/.zig-cache --global-cache-dir ../../.zig-cache",
     "native:run": "sh scripts/zig-015.sh build run --build-file native/build.zig --cache-dir native/.zig-cache --global-cache-dir ../../.zig-cache",
     "native:test": "sh scripts/zig-015.sh build test --build-file native/build.zig --cache-dir native/.zig-cache --global-cache-dir ../../.zig-cache",
+    "e2e": "playwright test",
     "build:deps": "pnpm --filter @wterm/core build && pnpm --filter @wterm/dom build",
     "build": "pnpm build:deps && vite build",
     "preview": "vite preview",
@@ -22,6 +23,7 @@
   },
   "devDependencies": {
     "@internal/ts": "workspace:*",
+    "@playwright/test": "^1.60.0",
     "@types/node": "^25.9.1",
     "typescript": "^6.0.3",
     "vite": "^8.0.16"

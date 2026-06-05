@@ -145,6 +145,13 @@ export class InputHandler {
       if (sel && sel.toString().length > 0) return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key === "v") {
+      const clipboard = (navigator as Navigator & { clipboard?: Clipboard })
+        .clipboard;
+      if (clipboard) {
+        e.preventDefault();
+        void this.pasteFromClipboard(clipboard);
+        return;
+      }
       this.textarea.focus();
       return;
     }
@@ -174,7 +181,19 @@ export class InputHandler {
     e.preventDefault();
     const text = e.clipboardData?.getData("text");
     if (!text) return;
+    this.sendPastedText(text);
+  }
 
+  private async pasteFromClipboard(clipboard: Clipboard): Promise<void> {
+    try {
+      const text = await clipboard.readText();
+      if (text) this.sendPastedText(text);
+    } catch {
+      this.textarea.focus();
+    }
+  }
+
+  private sendPastedText(text: string): void {
     const bridge = this.getBridge();
     if (bridge && bridge.bracketedPaste()) {
       // Strip ESC bytes so clipboard payloads cannot inject \x1b[201~ to

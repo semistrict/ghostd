@@ -21,6 +21,7 @@ const DEFAULT_COLOR: u16 = 256;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: usize = 64;
+const SNAPSHOT_COALESCE_MS: i64 = 16;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 const Cell = struct {
@@ -533,12 +534,11 @@ fn spawnPty(cols: u16, rows: u16) !c_int {
     return master;
 }
 
-fn resizePty(fd: c_int, terminal: *vt.Terminal, alloc: std.mem.Allocator, cols: u16, rows: u16) !void {
+fn resizePty(fd: c_int, cols: u16, rows: u16) !void {
     var winsize: c.struct_winsize = std.mem.zeroes(c.struct_winsize);
     winsize.ws_col = cols;
     winsize.ws_row = rows;
     if (c.ioctl(fd, c.TIOCSWINSZ, &winsize) < 0) return error.ResizeFailed;
-    try terminal.resize(alloc, cols, rows);
 }
 
 fn findHeader(request: []const u8, name: []const u8) ?[]const u8 {
@@ -794,6 +794,9 @@ pub fn main() !void {
     std.debug.print("ghostd native listening on http://127.0.0.1:{d}\n", .{port});
 
     var pty_buf: [8192]u8 = undefined;
+    var pending_resize: ?struct { cols: u16, rows: u16 } = null;
+    var pending_snapshot = false;
+    var last_pty_output_ms: i64 = 0;
     while (true) {
         var pollfds: [2 + MAX_CLIENTS]c.struct_pollfd = undefined;
         const polled_clients = clients.items.len;
@@ -804,10 +807,22 @@ pub fn main() !void {
         }
 
         const nfds: c.nfds_t = @intCast(2 + polled_clients);
-        const ready = c.poll(&pollfds, nfds, -1);
+        const poll_timeout: c_int = if (pending_snapshot) blk: {
+            const elapsed = std.time.milliTimestamp() - last_pty_output_ms;
+            break :blk @intCast(@max(0, SNAPSHOT_COALESCE_MS - elapsed));
+        } else -1;
+        const ready = c.poll(&pollfds, nfds, poll_timeout);
         if (ready < 0) {
             if (c.__error().* == c.EINTR) continue;
             return error.PollFailed;
+        }
+
+        if (ready == 0) {
+            if (pending_snapshot) {
+                try broadcastSnapshot(alloc, &clients, &terminal, &render);
+                pending_snapshot = false;
+            }
+            continue;
         }
 
         if ((pollfds[0].revents & c.POLLIN) != 0 and clients.items.len < MAX_CLIENTS) {
@@ -822,10 +837,15 @@ pub fn main() !void {
                     return error.PtyReadFailed;
                 }
                 if (n == 0) return;
+                if (pending_resize) |size| {
+                    try terminal.resize(alloc, size.cols, size.rows);
+                    pending_resize = null;
+                }
                 try stream.nextSlice(pty_buf[0..@intCast(n)]);
                 if (n < pty_buf.len) break;
             }
-            try broadcastSnapshot(alloc, &clients, &terminal, &render);
+            pending_snapshot = true;
+            last_pty_output_ms = std.time.milliTimestamp();
         }
 
         var idx: usize = 0;
@@ -863,8 +883,8 @@ pub fn main() !void {
                 },
                 .resize => |size| {
                     if (clients.items[idx].role == .writer) {
-                        try resizePty(pty_fd, &terminal, alloc, size.cols, size.rows);
-                        try broadcastSnapshot(alloc, &clients, &terminal, &render);
+                        try resizePty(pty_fd, size.cols, size.rows);
+                        pending_resize = .{ .cols = size.cols, .rows = size.rows };
                     }
                 },
                 .scroll => |scroll| {
@@ -884,6 +904,11 @@ pub fn main() !void {
                 .unknown => {},
             }
             idx += 1;
+        }
+
+        if (pending_snapshot and std.time.milliTimestamp() - last_pty_output_ms >= SNAPSHOT_COALESCE_MS) {
+            try broadcastSnapshot(alloc, &clients, &terminal, &render);
+            pending_snapshot = false;
         }
     }
 }

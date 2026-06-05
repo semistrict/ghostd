@@ -72,6 +72,11 @@ function syncWriterSize(options: { force?: boolean } = {}): void {
   }
   lastSentCols = size.cols;
   lastSentRows = size.rows;
+  if (size.cols === renderedCols && size.rows === renderedRows) {
+    if (options.force) core.forceResize();
+    core.resize(size.cols, size.rows);
+    return;
+  }
   if (options.force) core.forceResize();
   renderedCols = size.cols;
   renderedRows = size.rows;
@@ -87,7 +92,6 @@ core.onUpdate = () => {
     term.resize(cols, rows);
   }
   term.write(new Uint8Array());
-  requestAnimationFrame(() => syncWriterSize());
 };
 
 core.onRoleChange = (role: ClientRole) => {
@@ -98,12 +102,13 @@ core.onRoleChange = (role: ClientRole) => {
   if (role === "writer") {
     term.focus();
     requestAnimationFrame(() => syncWriterSize({ force: true }));
-    window.setTimeout(() => syncWriterSize({ force: true }), 100);
-    window.setTimeout(() => syncWriterSize({ force: true }), 500);
   }
 };
 
 claimWriterButton.addEventListener("click", () => core.claimWriter());
+window.addEventListener("resize", () => {
+  requestAnimationFrame(() => syncWriterSize());
+});
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));

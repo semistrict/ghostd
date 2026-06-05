@@ -192,6 +192,14 @@ describe("InputHandler", () => {
   });
 
   describe("paste", () => {
+    beforeEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
     it("sends pasted text as-is without bracketed paste", () => {
       const ta = getTextarea();
       const pasteEvent = new Event("paste", {
@@ -229,6 +237,29 @@ describe("InputHandler", () => {
       ta.dispatchEvent(pasteEvent);
       expect(received.join("")).toBe("\x1b[200~safe[201~rm -rf /\r\x1b[201~");
       expect(received.join("")).not.toContain("\x1b[201~rm");
+    });
+
+    it("reads clipboard text for Cmd+V", async () => {
+      vi.stubGlobal("navigator", {
+        clipboard: { readText: vi.fn().mockResolvedValue("shortcut paste") },
+      });
+      const ta = getTextarea();
+      ta.dispatchEvent(createKeyboardEvent("v", { metaKey: true }));
+      await vi.waitFor(() => {
+        expect(received).toContain("shortcut paste");
+      });
+    });
+
+    it("applies bracketed paste to Cmd+V clipboard text", async () => {
+      vi.stubGlobal("navigator", {
+        clipboard: { readText: vi.fn().mockResolvedValue("hello") },
+      });
+      bridgeMock = { bracketedPaste: () => true } as any;
+      const ta = getTextarea();
+      ta.dispatchEvent(createKeyboardEvent("v", { metaKey: true }));
+      await vi.waitFor(() => {
+        expect(received).toContain("\x1b[200~hello\x1b[201~");
+      });
     });
   });
 

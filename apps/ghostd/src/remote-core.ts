@@ -51,7 +51,7 @@ export class RemoteTerminalCore implements TerminalCore {
     if (!force && cols === this.cols && rows === this.rows) return;
     this.cols = cols;
     this.rows = rows;
-    this.viewport = Array.from({ length: rows }, () => this.blankRow());
+    this.viewport = this.resizeViewport(cols, rows);
     for (let row = 0; row < rows; row++) this.dirtyRows.add(row);
     this.send({ type: "resize", cols, rows });
   }
@@ -171,16 +171,18 @@ export class RemoteTerminalCore implements TerminalCore {
 
   private applyMessage(message: ServerMessage): void {
     if (message.type === "snapshot") {
+      const resized = message.cols !== this.cols || message.rows !== this.rows;
       this.cols = message.cols;
       this.rows = message.rows;
-      this.setRole(message.role, true);
+      this.setRole(message.role);
       this.cursor = message.cursor;
       this.mouseReporting = message.mouseReporting;
       this.scrollback = message.scrollback;
       this.scrollbackLineLens = message.scrollbackLineLens;
-      this.viewport = Array.from({ length: this.rows }, () => this.blankRow());
+      if (resized || this.viewport.length !== this.rows) {
+        this.viewport = Array.from({ length: this.rows }, () => this.blankRow());
+      }
       this.applyRows(message.viewport);
-      for (let row = 0; row < this.rows; row++) this.dirtyRows.add(row);
       return;
     }
 
@@ -197,6 +199,7 @@ export class RemoteTerminalCore implements TerminalCore {
 
   private applyRows(rows: PackedRow[]): void {
     for (const row of rows) {
+      if (this.rowsEqual(this.viewport[row.index], row.cells)) continue;
       this.viewport[row.index] = row.cells;
       this.dirtyRows.add(row.index);
     }
@@ -204,6 +207,36 @@ export class RemoteTerminalCore implements TerminalCore {
 
   private blankRow(): CellData[] {
     return Array.from({ length: this.cols }, () => BLANK_CELL);
+  }
+
+  private resizeViewport(cols: number, rows: number): CellData[][] {
+    return Array.from({ length: rows }, (_, row) => {
+      const existing = this.viewport[row] ?? [];
+      return Array.from(
+        { length: cols },
+        (_, col) => existing[col] ?? BLANK_CELL,
+      );
+    });
+  }
+
+  private rowsEqual(a: CellData[] | undefined, b: CellData[]): boolean {
+    if (!a || a.length !== b.length) return false;
+    for (let i = 0; i < b.length; i++) {
+      if (!this.cellsEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  private cellsEqual(a: CellData | undefined, b: CellData): boolean {
+    return (
+      !!a &&
+      a.char === b.char &&
+      a.fg === b.fg &&
+      a.bg === b.bg &&
+      a.flags === b.flags &&
+      a.fgRgb === b.fgRgb &&
+      a.bgRgb === b.bgRgb
+    );
   }
 
   private setRole(role: ClientRole, forceNotify = false): void {
