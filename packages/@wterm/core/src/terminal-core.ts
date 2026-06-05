@@ -23,9 +23,8 @@ export interface UnhandledSequence {
 }
 
 /**
- * Abstract terminal emulation core. Both the built-in Zig WASM core
- * (`WasmBridge`) and alternative backends (e.g. `@wterm/ghostty`) implement
- * this interface so that `@wterm/dom` can render any core interchangeably.
+ * Abstract terminal emulation core. The built-in Zig WASM core (`WasmBridge`)
+ * implements this interface so that `@wterm/dom` can render it.
  */
 export interface TerminalCore {
   // -- Lifecycle --

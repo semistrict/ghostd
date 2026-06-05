@@ -1,35 +1,16 @@
 {
-  "name": "wterm",
+  "name": "ghostd-workspace",
   "private": true,
   "license": "Apache-2.0",
-  "homepage": "https://wterm.dev",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/vercel-labs/wterm"
-  },
   "engines": {
     "node": ">=24.0.0",
     "pnpm": ">=11.0.0"
   },
   "scripts": {
-    "build": "turbo run build",
-    "predev": "command -v portless >/dev/null 2>&1 || (echo '\\nportless is required but not installed. Run: npm i -g portless\\nSee: https://github.com/vercel-labs/portless\\n' && exit 1)",
-    "dev": "turbo run dev --concurrency 50",
-    "format": "prettier --write \"**/*.{ts,tsx,js,jsx}\" --ignore-path .gitignore",
-    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx}\" --ignore-path .gitignore",
-    "lint": "turbo run lint",
-    "sync-versions": "node scripts/sync-versions.mjs",
-    "test": "turbo run test",
-    "test:e2e": "playwright test --config e2e/playwright.config.ts",
-    "test:e2e:ui": "playwright test --config e2e/playwright.config.ts --ui",
-    "type-check": "turbo run type-check"
-  },
-  "devDependencies": {
-    "@playwright/test": "^1.59.1",
-    "@vitest/coverage-v8": "^4.1.4",
-    "prettier": "^3.8.2",
-    "turbo": "^2.9.6",
-    "vitest": "^4.1.4"
+    "dev": "pnpm --filter ghostd dev",
+    "build": "pnpm --filter ghostd build",
+    "type-check": "pnpm --filter @wterm/core type-check && pnpm --filter @wterm/dom type-check && pnpm --filter ghostd type-check",
+    "test": "pnpm --filter @wterm/dom test && pnpm --filter ghostd native:test"
   },
   "packageManager": "pnpm@11.1.3"
 }

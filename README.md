@@ -1,95 +1,46 @@
-# wterm
+# ghostd
 
-A terminal emulator for the web.
+Native Ghostty-backed terminal daemon with a browser client.
 
-wterm ("dub-term") renders to the DOM — native text selection, copy/paste, find, and accessibility come for free. The core is written in Zig and compiled to WASM for near-native performance.
+`ghostd` starts one long-lived PTY, renders it through Ghostty's native Zig
+`ghostty-vt` core, and serves a small HTML client that can connect, reconnect,
+watch as a reader, or claim the single writer role.
 
-## Packages
+## Workspace
 
-| Package | Description |
-|---|---|
-| [`@wterm/core`](packages/@wterm/core) | Headless WASM bridge, `TerminalCore` interface, WebSocket transport |
-| [`@wterm/dom`](packages/@wterm/dom) | DOM renderer, input handler — vanilla JS terminal |
-| [`@wterm/react`](packages/@wterm/react) | React component + `useTerminal` hook (TypeScript) |
-| [`@wterm/vue`](packages/@wterm/vue) | Vue 3 component + template ref API |
-| [`@wterm/ghostty`](packages/@wterm/ghostty) | Full-featured VT emulation core powered by libghostty |
-| [`@wterm/just-bash`](packages/@wterm/just-bash) | In-browser Bash shell powered by just-bash |
-| [`@wterm/markdown`](packages/@wterm/markdown) | Render Markdown in the terminal |
+This repo has been trimmed to the files needed for `ghostd`:
 
-## Features
+- [`apps/ghostd`](apps/ghostd) - native daemon and browser client
+- [`packages/@wterm/dom`](packages/@wterm/dom) - DOM terminal renderer and input handling
+- [`packages/@wterm/core`](packages/@wterm/core) - shared terminal core types used by the renderer
+- [`packages/@internal/ts`](packages/@internal/ts) - shared TypeScript config
 
-- **Pluggable cores** — built-in lightweight Zig core (~12 KB) or opt-in [libghostty](packages/@wterm/ghostty) backend (~400 KB) for full VT compliance
-- **Zig + WASM core** — VT100/VT220/xterm escape sequence parser compiled to a ~12 KB `.wasm` binary (release build)
-- **DOM rendering** — native text selection, clipboard, browser find, and screen reader support
-- **Dirty-row tracking** — only touched rows are re-rendered each frame via `requestAnimationFrame`
-- **Themes** — CSS custom properties with built-in Default, Solarized Dark, Monokai, and Light themes
-- **Alternate screen buffer** — `vim`, `less`, `htop`, and similar apps work correctly
-- **Scrollback history** — configurable ring buffer
-- **24-bit color** — full RGB SGR support
-- **Auto-resize** — `ResizeObserver`-based terminal resizing
-- **WebSocket transport** — connect to a PTY backend with binary framing and reconnection
+## Requirements
 
-## Development
+- Node.js 24+
+- pnpm 11+
+- Zig 0.15.2 (`brew install zig@0.15`)
+- portless installed globally with pnpm (`pnpm add -g portless`)
 
-### Prerequisites
-
-- [Zig](https://ziglang.org/) 0.16.0+
-- [Node.js](https://nodejs.org/) 24+
-- [pnpm](https://pnpm.io/) 11+
-
-### Setup
+## Run
 
 ```bash
 pnpm install
+pnpm dev
 ```
 
-### Build the WASM binary
+The app is served at:
 
-```bash
-zig build
+```text
+https://ghostd.wterm.localhost
 ```
 
-For a release build:
-
-```bash
-zig build -Doptimize=ReleaseSmall
-```
-
-### Build all packages
+## Verify
 
 ```bash
 pnpm build
-```
-
-### Run the vanilla demo
-
-Serve the `web/` directory with any static file server:
-
-```bash
-cd web && python3 -m http.server 8000
-```
-
-### Run the Next.js example
-
-All dev servers use [portless](https://github.com/vercel-labs/portless) to avoid hardcoded ports. Each app is served at a `.localhost` URL (e.g. `nextjs-example.wterm.localhost`).
-
-```bash
-cp web/wterm.wasm examples/nextjs/public/
-pnpm --filter nextjs dev
-```
-
-### Run ghostd
-
-This builds the browser client and starts one native Ghostty-backed terminal daemon. Browser refreshes and multiple clients attach to the same session over MessagePack WebSocket frames.
-
-```bash
-pnpm --filter ghostd dev
-```
-
-### Run Zig tests
-
-```bash
-zig build test
+pnpm type-check
+pnpm test
 ```
 
 ## License
