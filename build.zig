@@ -25,8 +25,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibC();
     if (exe.rootModuleTarget().os.tag == .linux) {
-        exe.addSystemIncludePath(.{ .cwd_relative = "/usr/include/bsd" });
-        exe.linkSystemLibrary("bsd");
+        exe.linkSystemLibrary("util");
     }
     b.installArtifact(exe);
 

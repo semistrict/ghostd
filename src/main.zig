@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const StreamAction = vt.StreamAction;
 const embedded_assets = @import("embedded_assets.zig");
@@ -16,7 +17,11 @@ const c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("termios.h");
     @cInclude("unistd.h");
-    @cInclude("util.h");
+    if (builtin.os.tag == .linux) {
+        @cInclude("pty.h");
+    } else {
+        @cInclude("util.h");
+    }
 });
 
 const DEFAULT_COLOR: u16 = 256;
