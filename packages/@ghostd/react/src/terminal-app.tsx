@@ -17,6 +17,7 @@ export interface GhostdTerminalAppProps {
   rows?: number;
   className?: string;
   terminalClassName?: string;
+  autoClaimWriter?: boolean;
 }
 
 type ConnectionState = "connecting" | "open" | "closed" | "error";
@@ -59,6 +60,13 @@ function resolveBaseUrl(baseUrl: string | URL | undefined): URL {
   return new URL(".", window.location.href);
 }
 
+function withWriterRequest(url: string, enabled: boolean): string {
+  if (!enabled) return url;
+  const next = new URL(url);
+  next.searchParams.set("writer", "1");
+  return next.href;
+}
+
 export function GhostdTerminalApp({
   baseUrl,
   initialTerminalId = 0,
@@ -66,6 +74,7 @@ export function GhostdTerminalApp({
   rows = 24,
   className,
   terminalClassName,
+  autoClaimWriter = false,
 }: GhostdTerminalAppProps) {
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const coreRef = useRef<RemoteTerminalCore | null>(null);
@@ -136,7 +145,10 @@ export function GhostdTerminalApp({
     };
 
     function terminalUrl(terminalId: TerminalId) {
-      return ghostdTerminalWebSocketUrl(base, terminalId);
+      return withWriterRequest(
+        ghostdTerminalWebSocketUrl(base, terminalId),
+        autoClaimWriter,
+      );
     }
 
     function measureCellSize(): {
@@ -297,6 +309,9 @@ export function GhostdTerminalApp({
       setRole(nextRole);
       terminalElement.classList.toggle("is-reader", nextRole === "reader");
       terminalElement.classList.toggle("is-writer", nextRole === "writer");
+      if (autoClaimWriter && nextRole === "reader") {
+        core.claimWriter();
+      }
       if (nextRole === "writer") {
         terminal.focus();
         requestAnimationFrame(() => syncWriterSize({ force: true }));
@@ -371,14 +386,17 @@ export function GhostdTerminalApp({
       if (coreRef.current === core) coreRef.current = null;
       if (terminalRef.current === terminal) terminalRef.current = null;
     };
-  }, [baseUrlValue, cols, initialTerminalId, rows]);
+  }, [autoClaimWriter, baseUrlValue, cols, initialTerminalId, rows]);
 
   function handleSwitchTerminal(terminalId: TerminalId) {
     setCurrentTerminalId(terminalId);
     setConnectionState("connecting");
     scrollToBottomOnUpdateRef.current = true;
     coreRef.current?.connect(
-      ghostdTerminalWebSocketUrl(resolveBaseUrl(baseUrlValue), terminalId),
+      withWriterRequest(
+        ghostdTerminalWebSocketUrl(resolveBaseUrl(baseUrlValue), terminalId),
+        autoClaimWriter,
+      ),
     );
   }
 

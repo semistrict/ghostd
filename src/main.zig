@@ -950,13 +950,27 @@ fn sendHttp(fd: c_int, status: []const u8, body: []const u8) !void {
 }
 
 fn requestPath(request: []const u8) []const u8 {
+    const raw = requestTarget(request);
+    const query = std.mem.indexOfScalar(u8, raw, '?') orelse raw.len;
+    return raw[0..query];
+}
+
+fn requestTarget(request: []const u8) []const u8 {
     const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
     const first_line = request[0..first_line_end];
     var parts = std.mem.splitScalar(u8, first_line, ' ');
     _ = parts.next();
-    const raw = parts.next() orelse "/";
-    const query = std.mem.indexOfScalar(u8, raw, '?') orelse raw.len;
-    return raw[0..query];
+    return parts.next() orelse "/";
+}
+
+fn requestWantsWriter(request: []const u8) bool {
+    const target = requestTarget(request);
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return false;
+    var params = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+    while (params.next()) |param| {
+        if (std.mem.eql(u8, param, "writer=1")) return true;
+    }
+    return false;
 }
 
 fn acceptsHtml(request: []const u8) bool {
@@ -1168,7 +1182,10 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, terminals: *std.arra
     const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
     try writeAllFd(fd, response);
 
-    const role: Role = if (session.clients.items.len == 0) .writer else .reader;
+    const role: Role = if (session.clients.items.len == 0 or requestWantsWriter(request)) .writer else .reader;
+    if (role == .writer) {
+        for (session.clients.items) |*client| client.role = .reader;
+    }
     try session.clients.append(.{ .fd = fd, .role = role, .terminal_id = session.id });
     const client_index = session.clients.items.len - 1;
 
