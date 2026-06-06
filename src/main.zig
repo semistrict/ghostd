@@ -797,6 +797,29 @@ fn parsePort(args: []const []const u8) u16 {
     return 7341;
 }
 
+fn wantsHelp(args: []const []const u8) bool {
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
+}
+
+fn printUsage() !void {
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    try stdout.writeAll(
+        \\Usage: ghostd [--port PORT]
+        \\
+        \\Options:
+        \\  -h, --help     Show this help message.
+        \\  --port PORT    Listen on PORT (default: 7341, or PORT env var).
+        \\
+    );
+    try stdout.flush();
+}
+
 fn setNonblocking(fd: c_int) !void {
     const flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
     if (flags < 0) return error.FcntlFailed;
@@ -1250,6 +1273,10 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
+    if (wantsHelp(args)) {
+        try printUsage();
+        return;
+    }
     const port = parsePort(args);
 
     const listen_fd = try createListenSocket(port);
