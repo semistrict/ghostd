@@ -11,6 +11,7 @@ import type {
   PackedRow,
   ServerMessage,
   TerminalId,
+  TerminalSummary,
 } from "./protocol.js";
 import {
   decodeServerMessage,
@@ -42,6 +43,9 @@ export class RemoteTerminalCore implements TerminalCore {
 
   onUpdate: (() => void) | null = null;
   onRoleChange: ((role: ClientRole) => void) | null = null;
+  onTerminalCreated: ((terminal: TerminalSummary) => void) | null = null;
+  onTerminals: ((terminals: TerminalSummary[]) => void) | null = null;
+  onTerminalClosed: ((terminalId: TerminalId) => void) | null = null;
 
   constructor(terminalId: TerminalId = 0) {
     this.terminalId = terminalId;
@@ -87,6 +91,18 @@ export class RemoteTerminalCore implements TerminalCore {
         setTimeout(() => this.connect(url), 1000);
       }
     };
+  }
+
+  getTerminalId(): TerminalId {
+    return this.terminalId;
+  }
+
+  createTerminal(cols: number, rows: number): void {
+    this.send({ type: "createTerminal", cols, rows });
+  }
+
+  listTerminals(): void {
+    this.send({ type: "listTerminals" });
   }
 
   writeString(str: string): void {
@@ -182,10 +198,11 @@ export class RemoteTerminalCore implements TerminalCore {
   private applyMessage(message: ServerMessage): void {
     if (message.type === "snapshot") {
       const resized = message.cols !== this.cols || message.rows !== this.rows;
+      const terminalChanged = message.terminalId !== this.terminalId;
       this.terminalId = message.terminalId;
       this.cols = message.cols;
       this.rows = message.rows;
-      this.setRole(message.role);
+      this.setRole(message.role, terminalChanged);
       this.cursor = message.cursor;
       this.mouseReporting = message.mouseReporting;
       this.scrollback = message.scrollback;
@@ -204,7 +221,23 @@ export class RemoteTerminalCore implements TerminalCore {
     }
 
     if (message.type === "role") {
+      if (message.terminalId !== this.terminalId) return;
       this.setRole(message.role);
+      return;
+    }
+
+    if (message.type === "terminals") {
+      this.onTerminals?.(message.terminals);
+      return;
+    }
+
+    if (message.type === "terminalCreated") {
+      this.onTerminalCreated?.(message.terminal);
+      return;
+    }
+
+    if (message.type === "terminalClosed") {
+      this.onTerminalClosed?.(message.terminalId);
     }
   }
 

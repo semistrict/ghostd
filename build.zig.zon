@@ -2,7 +2,7 @@
     .name = .ghostd,
     .version = "0.1.0",
     .fingerprint = 0x390f8a22f1e9325e,
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .ghostty = .{
             .url = "https://github.com/ghostty-org/ghostty/archive/v1.3.1.tar.gz",

@@ -1,10 +1,13 @@
 import { GhostdWebTerminal } from "@ghostd-web/dom";
 import "@ghostd-web/dom/css";
 import { RemoteTerminalCore } from "./remote-core.js";
-import type { ClientRole } from "./protocol.js";
+import type { ClientRole, TerminalId, TerminalSummary } from "./protocol.js";
 
 const container = document.getElementById("terminal")!;
 const status = document.getElementById("status")!;
+const tabs = document.getElementById("tabs")!;
+const newTerminalButton =
+  document.querySelector<HTMLButtonElement>("#new-terminal")!;
 const claimWriterButton =
   document.querySelector<HTMLButtonElement>("#claim-writer")!;
 const core = new RemoteTerminalCore();
@@ -22,6 +25,23 @@ let lastSentCols = core.getCols();
 let lastSentRows = core.getRows();
 let renderedCols = core.getCols();
 let renderedRows = core.getRows();
+let activeTerminalId: TerminalId = 0;
+let terminals = new Map<TerminalId, TerminalSummary>([
+  [
+    0,
+    {
+      terminalId: 0,
+      title: null,
+      cols: 80,
+      rows: 24,
+      role: "reader",
+      writerConnected: false,
+    },
+  ],
+]);
+const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+const terminalUrl = (terminalId: TerminalId) =>
+  `${proto}//${window.location.host}/api/terminal?id=${terminalId}`;
 
 function measureCellSize(): {
   grid: HTMLElement;
@@ -50,10 +70,14 @@ function measureCellSize(): {
 function measureTerminal(): { cols: number; rows: number } | null {
   const cell = measureCellSize();
   if (!cell) return null;
+  const style = getComputedStyle(container);
+  const verticalPadding =
+    Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+  const availableHeight = Math.max(0, container.clientHeight - verticalPadding);
 
   return {
     cols: Math.max(1, Math.floor(cell.grid.clientWidth / cell.charWidth)),
-    rows: Math.max(1, Math.floor(cell.grid.clientHeight / cell.rowHeight)),
+    rows: Math.max(1, Math.floor(availableHeight / cell.rowHeight)),
   };
 }
 
@@ -83,6 +107,42 @@ function syncWriterSize(options: { force?: boolean } = {}): void {
   term.resize(size.cols, size.rows);
 }
 
+function renderTabs(): void {
+  tabs.replaceChildren(
+    ...Array.from(terminals.values())
+      .sort((a, b) => a.terminalId - b.terminalId)
+      .map((terminal) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "terminal-tab";
+        button.dataset.terminalTab = String(terminal.terminalId);
+        button.setAttribute("role", "tab");
+        button.setAttribute(
+          "aria-selected",
+          String(terminal.terminalId === activeTerminalId),
+        );
+        button.textContent = terminal.title ?? `term ${terminal.terminalId}`;
+        button.addEventListener("click", () => switchTerminal(terminal.terminalId));
+        return button;
+      }),
+  );
+}
+
+function resetRenderState(): void {
+  lastSentCols = core.getCols();
+  lastSentRows = core.getRows();
+  renderedCols = core.getCols();
+  renderedRows = core.getRows();
+  term.resize(renderedCols, renderedRows);
+  term.write(new Uint8Array());
+}
+
+function switchTerminal(terminalId: TerminalId): void {
+  activeTerminalId = terminalId;
+  renderTabs();
+  core.connect(terminalUrl(terminalId));
+}
+
 core.onUpdate = () => {
   const cols = core.getCols();
   const rows = core.getRows();
@@ -105,7 +165,34 @@ core.onRoleChange = (role: ClientRole) => {
   }
 };
 
+core.onTerminals = (nextTerminals) => {
+  terminals = new Map(nextTerminals.map((terminal) => [terminal.terminalId, terminal]));
+  if (!terminals.has(activeTerminalId)) {
+    activeTerminalId = terminals.keys().next().value ?? 0;
+  }
+  renderTabs();
+};
+
+core.onTerminalCreated = (terminal) => {
+  terminals.set(terminal.terminalId, terminal);
+  switchTerminal(terminal.terminalId);
+};
+
+core.onTerminalClosed = (terminalId) => {
+  terminals.delete(terminalId);
+  if (terminalId === activeTerminalId) {
+    activeTerminalId = terminals.keys().next().value ?? 0;
+    switchTerminal(activeTerminalId);
+  } else {
+    renderTabs();
+  }
+};
+
 claimWriterButton.addEventListener("click", () => core.claimWriter());
+newTerminalButton.addEventListener("click", () => {
+  const size = measureTerminal() ?? { cols: core.getCols(), rows: core.getRows() };
+  core.createTerminal(size.cols, size.rows);
+});
 window.addEventListener("resize", () => {
   requestAnimationFrame(() => syncWriterSize());
 });
@@ -158,5 +245,5 @@ container.addEventListener("wheel", sendWheelInput, { passive: false });
 
 new ResizeObserver(() => syncWriterSize()).observe(container);
 
-const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-core.connect(`${proto}//${window.location.host}/api/terminal`);
+renderTabs();
+core.connect(terminalUrl(activeTerminalId));

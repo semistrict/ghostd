@@ -22,6 +22,7 @@ const DEFAULT_COLOR: u16 = 256;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: usize = 64;
+const MAX_TERMINALS: usize = 16;
 const SNAPSHOT_COALESCE_MS: i64 = 16;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_TERMINAL_ID: u32 = 0;
@@ -92,12 +93,61 @@ const ClientMessage = union(enum) {
     resize: struct { terminal_id: u32, cols: u16, rows: u16 },
     scroll: struct { terminal_id: u32, rows: u16, direction: ScrollDirection },
     claim_writer: struct { terminal_id: u32 },
+    list_terminals,
+    create_terminal: struct { cols: u16, rows: u16 },
+    close_terminal: struct { terminal_id: u32 },
     unknown,
 };
 
 const Client = struct {
     fd: c_int,
     role: Role,
+    terminal_id: u32,
+};
+
+const TerminalSession = struct {
+    id: u32,
+    pty_fd: c_int,
+    terminal: vt.Terminal,
+    stream: vt.ReadonlyStream,
+    render: vt.RenderState,
+    clients: std.array_list.Managed(Client),
+    pending_resize: ?struct { cols: u16, rows: u16 } = null,
+    pending_snapshot: bool = false,
+    last_pty_output_ms: i64 = 0,
+
+    fn create(alloc: std.mem.Allocator, id: u32, cols: u16, rows: u16) !*TerminalSession {
+        const session = try alloc.create(TerminalSession);
+        errdefer alloc.destroy(session);
+        session.* = undefined;
+        session.id = id;
+        session.pty_fd = -1;
+        session.terminal = try .init(alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .max_scrollback = 10 * 1024 * 1024,
+        });
+        errdefer session.terminal.deinit(alloc);
+        session.stream = session.terminal.vtStream();
+        errdefer session.stream.deinit();
+        session.render = .empty;
+        session.clients = std.array_list.Managed(Client).init(alloc);
+        session.pending_resize = null;
+        session.pending_snapshot = false;
+        session.last_pty_output_ms = 0;
+        session.pty_fd = try spawnPty(cols, rows);
+        return session;
+    }
+
+    fn deinit(self: *TerminalSession, alloc: std.mem.Allocator) void {
+        for (self.clients.items) |client| _ = c.close(client.fd);
+        self.clients.deinit();
+        self.stream.deinit();
+        self.render.deinit(alloc);
+        self.terminal.deinit(alloc);
+        if (self.pty_fd >= 0) _ = c.close(self.pty_fd);
+        alloc.destroy(self);
+    }
 };
 
 fn packRgb(rgb: vt.color.RGB) u24 {
@@ -302,13 +352,13 @@ fn encodeCell(writer: *MsgpackWriter, cell: Cell) !void {
     }
 }
 
-fn encodeSnapshot(alloc: std.mem.Allocator, snap: Snapshot, role: Role) ![]u8 {
+fn encodeSnapshot(alloc: std.mem.Allocator, terminal_id: u32, snap: Snapshot, role: Role) ![]u8 {
     var writer = MsgpackWriter.init(alloc);
     errdefer writer.deinit();
 
     try writer.array(10);
     try writer.uint(@intFromEnum(ServerOpcode.snapshot));
-    try writer.uint(DEFAULT_TERMINAL_ID);
+    try writer.uint(terminal_id);
     try writer.uint(snap.cols);
     try writer.uint(snap.rows);
     try writer.uint(@intFromEnum(role.wire()));
@@ -333,13 +383,53 @@ fn encodeSnapshot(alloc: std.mem.Allocator, snap: Snapshot, role: Role) ![]u8 {
     return writer.buf.toOwnedSlice();
 }
 
-fn encodeRole(alloc: std.mem.Allocator, role: Role) ![]u8 {
+fn encodeRole(alloc: std.mem.Allocator, terminal_id: u32, role: Role) ![]u8 {
     var writer = MsgpackWriter.init(alloc);
     errdefer writer.deinit();
     try writer.array(3);
     try writer.uint(@intFromEnum(ServerOpcode.role));
-    try writer.uint(DEFAULT_TERMINAL_ID);
+    try writer.uint(terminal_id);
     try writer.uint(@intFromEnum(role.wire()));
+    return writer.buf.toOwnedSlice();
+}
+
+fn encodeTerminals(alloc: std.mem.Allocator, terminals: *std.array_list.Managed(*TerminalSession)) ![]u8 {
+    var writer = MsgpackWriter.init(alloc);
+    errdefer writer.deinit();
+    try writer.array(2);
+    try writer.uint(@intFromEnum(ServerOpcode.terminals));
+    try writer.array(@intCast(terminals.items.len));
+    for (terminals.items) |session| {
+        var writer_connected = false;
+        for (session.clients.items) |client| {
+            if (client.role == .writer) {
+                writer_connected = true;
+                break;
+            }
+        }
+        try writer.array(6);
+        try writer.uint(session.id);
+        try writer.nilValue();
+        try writer.uint(session.terminal.cols);
+        try writer.uint(session.terminal.rows);
+        try writer.uint(@intFromEnum(WireRole.reader));
+        try writer.boolValue(writer_connected);
+    }
+    return writer.buf.toOwnedSlice();
+}
+
+fn encodeTerminalCreated(alloc: std.mem.Allocator, session: *TerminalSession) ![]u8 {
+    var writer = MsgpackWriter.init(alloc);
+    errdefer writer.deinit();
+    try writer.array(2);
+    try writer.uint(@intFromEnum(ServerOpcode.terminal_created));
+    try writer.array(6);
+    try writer.uint(session.id);
+    try writer.nilValue();
+    try writer.uint(session.terminal.cols);
+    try writer.uint(session.terminal.rows);
+    try writer.uint(@intFromEnum(WireRole.reader));
+    try writer.boolValue(false);
     return writer.buf.toOwnedSlice();
 }
 
@@ -466,10 +556,20 @@ fn decodeClientMessage(data: []const u8) !ClientMessage {
             const direction = std.meta.intToEnum(ScrollDirection, direction_raw) catch return .unknown;
             return .{ .scroll = .{ .terminal_id = terminal_id, .rows = rows, .direction = direction } };
         },
-        .list_terminals,
-        .create_terminal,
-        .close_terminal,
-        => return .unknown,
+        .list_terminals => {
+            if (len != 1) return .unknown;
+            return .list_terminals;
+        },
+        .create_terminal => {
+            if (len != 3) return .unknown;
+            const cols: u16 = @intCast(try reader.readUint());
+            const rows: u16 = @intCast(try reader.readUint());
+            return .{ .create_terminal = .{ .cols = cols, .rows = rows } };
+        },
+        .close_terminal => {
+            if (len != 2) return .unknown;
+            return .{ .close_terminal = .{ .terminal_id = try reader.readUint() } };
+        },
     }
 }
 
@@ -601,6 +701,23 @@ fn requestPath(request: []const u8) []const u8 {
     return raw[0..query];
 }
 
+fn requestTerminalId(request: []const u8) u32 {
+    const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
+    const first_line = request[0..first_line_end];
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    _ = parts.next();
+    const raw = parts.next() orelse return DEFAULT_TERMINAL_ID;
+    const query_start = std.mem.indexOfScalar(u8, raw, '?') orelse return DEFAULT_TERMINAL_ID;
+    var query = std.mem.splitScalar(u8, raw[query_start + 1 ..], '&');
+    while (query.next()) |part| {
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        if (std.mem.eql(u8, part[0..eq], "id")) {
+            return std.fmt.parseInt(u32, part[eq + 1 ..], 10) catch DEFAULT_TERMINAL_ID;
+        }
+    }
+    return DEFAULT_TERMINAL_ID;
+}
+
 fn sendStatic(fd: c_int, request: []const u8) !void {
     const path = requestPath(request);
     if (std.mem.indexOf(u8, path, "..") != null) {
@@ -621,7 +738,35 @@ fn sendStatic(fd: c_int, request: []const u8) !void {
     try writeAllFd(fd, asset.body);
 }
 
-fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, clients: *std.array_list.Managed(Client), terminal: *vt.Terminal, render: *vt.RenderState) !void {
+fn findSession(terminals: *std.array_list.Managed(*TerminalSession), terminal_id: u32) ?*TerminalSession {
+    for (terminals.items) |session| {
+        if (session.id == terminal_id) return session;
+    }
+    return null;
+}
+
+fn sendTerminals(alloc: std.mem.Allocator, fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
+    const payload = try encodeTerminals(alloc, terminals);
+    defer alloc.free(payload);
+    try sendWebsocket(fd, payload);
+}
+
+fn broadcastTerminals(alloc: std.mem.Allocator, terminals: *std.array_list.Managed(*TerminalSession)) void {
+    const payload = encodeTerminals(alloc, terminals) catch return;
+    defer alloc.free(payload);
+    for (terminals.items) |session| {
+        var i: usize = 0;
+        while (i < session.clients.items.len) {
+            sendWebsocket(session.clients.items[i].fd, payload) catch {
+                closeClient(session, i);
+                continue;
+            };
+            i += 1;
+        }
+    }
+}
+
+fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
     const fd = c.accept(listen_fd, null, null);
     if (fd < 0) return;
     errdefer _ = c.close(fd);
@@ -640,6 +785,11 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, clients: *std.array_
         try sendStatic(fd, request);
         return;
     };
+    const terminal_id = requestTerminalId(request);
+    const session = findSession(terminals, terminal_id) orelse {
+        try sendHttp(fd, "404 Not Found", "terminal not found\n");
+        return;
+    };
 
     const accept = try websocketAccept(alloc, key);
     defer alloc.free(accept);
@@ -647,18 +797,19 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, clients: *std.array_
     const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
     try writeAllFd(fd, response);
 
-    const role: Role = if (clients.items.len == 0) .writer else .reader;
-    try clients.append(.{ .fd = fd, .role = role });
-    const client_index = clients.items.len - 1;
+    const role: Role = if (session.clients.items.len == 0) .writer else .reader;
+    try session.clients.append(.{ .fd = fd, .role = role, .terminal_id = session.id });
+    const client_index = session.clients.items.len - 1;
 
-    const snap = try snapshot(alloc, terminal, render);
+    const snap = try snapshot(alloc, &session.terminal, &session.render);
     defer alloc.free(snap.cells);
-    const payload = try encodeSnapshot(alloc, snap, role);
+    const payload = try encodeSnapshot(alloc, session.id, snap, role);
     defer alloc.free(payload);
     sendWebsocket(fd, payload) catch {
-        closeClient(clients, client_index);
+        closeClient(session, client_index);
         return;
     };
+    sendTerminals(alloc, fd, terminals) catch {};
 }
 
 fn sendWebsocket(fd: c_int, payload: []const u8) !void {
@@ -724,45 +875,45 @@ fn readWebsocketFrame(alloc: std.mem.Allocator, fd: c_int) !?[]u8 {
     return payload;
 }
 
-fn closeClient(clients: *std.array_list.Managed(Client), index: usize) void {
-    const was_writer = clients.items[index].role == .writer;
-    _ = c.close(clients.items[index].fd);
-    _ = clients.swapRemove(index);
-    if (was_writer and clients.items.len > 0) clients.items[0].role = .writer;
+fn closeClient(session: *TerminalSession, index: usize) void {
+    const was_writer = session.clients.items[index].role == .writer;
+    _ = c.close(session.clients.items[index].fd);
+    _ = session.clients.swapRemove(index);
+    if (was_writer and session.clients.items.len > 0) session.clients.items[0].role = .writer;
 }
 
-fn broadcastSnapshot(alloc: std.mem.Allocator, clients: *std.array_list.Managed(Client), terminal: *vt.Terminal, render: *vt.RenderState) !void {
-    const snap = try snapshot(alloc, terminal, render);
+fn broadcastSnapshot(alloc: std.mem.Allocator, session: *TerminalSession) !void {
+    const snap = try snapshot(alloc, &session.terminal, &session.render);
     defer alloc.free(snap.cells);
     var i: usize = 0;
-    while (i < clients.items.len) {
-        const payload = try encodeSnapshot(alloc, snap, clients.items[i].role);
+    while (i < session.clients.items.len) {
+        const payload = try encodeSnapshot(alloc, session.id, snap, session.clients.items[i].role);
         defer alloc.free(payload);
-        sendWebsocket(clients.items[i].fd, payload) catch {
-            closeClient(clients, i);
+        sendWebsocket(session.clients.items[i].fd, payload) catch {
+            closeClient(session, i);
             continue;
         };
         i += 1;
     }
 }
 
-fn broadcastRoles(alloc: std.mem.Allocator, clients: *std.array_list.Managed(Client)) void {
+fn broadcastRoles(alloc: std.mem.Allocator, session: *TerminalSession) void {
     var i: usize = 0;
-    while (i < clients.items.len) {
-        const payload = encodeRole(alloc, clients.items[i].role) catch return;
+    while (i < session.clients.items.len) {
+        const payload = encodeRole(alloc, session.id, session.clients.items[i].role) catch return;
         defer alloc.free(payload);
-        sendWebsocket(clients.items[i].fd, payload) catch {
-            closeClient(clients, i);
+        sendWebsocket(session.clients.items[i].fd, payload) catch {
+            closeClient(session, i);
             continue;
         };
         i += 1;
     }
 }
 
-fn claimWriter(clients: *std.array_list.Managed(Client), index: usize) void {
-    if (index >= clients.items.len) return;
-    for (clients.items) |*client| client.role = .reader;
-    clients.items[index].role = .writer;
+fn claimWriter(session: *TerminalSession, index: usize) void {
+    if (index >= session.clients.items.len) return;
+    for (session.clients.items) |*client| client.role = .reader;
+    session.clients.items[index].role = .writer;
 }
 
 pub fn main() !void {
@@ -774,48 +925,58 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
     const port = parsePort(args);
 
-    var terminal: vt.Terminal = try .init(alloc, .{
-        .cols = DEFAULT_COLS,
-        .rows = DEFAULT_ROWS,
-        .max_scrollback = 10 * 1024 * 1024,
-    });
-    defer terminal.deinit(alloc);
-    var stream = terminal.vtStream();
-    defer stream.deinit();
-    var render: vt.RenderState = .empty;
-    defer render.deinit(alloc);
-
     const listen_fd = try createListenSocket(port);
     defer _ = c.close(listen_fd);
-    const pty_fd = try spawnPty(DEFAULT_COLS, DEFAULT_ROWS);
-    defer _ = c.close(pty_fd);
 
-    var clients = std.array_list.Managed(Client).init(alloc);
+    var terminals = std.array_list.Managed(*TerminalSession).init(alloc);
     defer {
-        for (clients.items) |client| _ = c.close(client.fd);
-        clients.deinit();
+        for (terminals.items) |session| session.deinit(alloc);
+        terminals.deinit();
     }
+    try terminals.append(try TerminalSession.create(alloc, DEFAULT_TERMINAL_ID, DEFAULT_COLS, DEFAULT_ROWS));
+    var next_terminal_id: u32 = 1;
 
     std.debug.print("ghostd native listening on http://127.0.0.1:{d}\n", .{port});
 
     var pty_buf: [8192]u8 = undefined;
-    var pending_resize: ?struct { cols: u16, rows: u16 } = null;
-    var pending_snapshot = false;
-    var last_pty_output_ms: i64 = 0;
     while (true) {
-        var pollfds: [2 + MAX_CLIENTS]c.struct_pollfd = undefined;
-        const polled_clients = clients.items.len;
+        var pollfds: [1 + MAX_TERMINALS + MAX_CLIENTS]c.struct_pollfd = undefined;
+        var polled_sessions: [MAX_TERMINALS]*TerminalSession = undefined;
+        var polled_client_sessions: [MAX_CLIENTS]*TerminalSession = undefined;
+        var polled_client_indexes: [MAX_CLIENTS]usize = undefined;
+        var session_count: usize = 0;
+        var client_count: usize = 0;
+
         pollfds[0] = .{ .fd = listen_fd, .events = c.POLLIN, .revents = 0 };
-        pollfds[1] = .{ .fd = pty_fd, .events = c.POLLIN, .revents = 0 };
-        for (clients.items[0..polled_clients], 0..) |client, i| {
-            pollfds[2 + i] = .{ .fd = client.fd, .events = c.POLLIN, .revents = 0 };
+        var poll_index: usize = 1;
+        for (terminals.items) |session| {
+            if (session_count >= MAX_TERMINALS) break;
+            polled_sessions[session_count] = session;
+            session_count += 1;
+            pollfds[poll_index] = .{ .fd = session.pty_fd, .events = c.POLLIN, .revents = 0 };
+            poll_index += 1;
+        }
+        for (terminals.items) |session| {
+            for (session.clients.items, 0..) |client, client_index| {
+                if (client_count >= MAX_CLIENTS) break;
+                polled_client_sessions[client_count] = session;
+                polled_client_indexes[client_count] = client_index;
+                client_count += 1;
+                pollfds[poll_index] = .{ .fd = client.fd, .events = c.POLLIN, .revents = 0 };
+                poll_index += 1;
+            }
         }
 
-        const nfds: c.nfds_t = @intCast(2 + polled_clients);
-        const poll_timeout: c_int = if (pending_snapshot) blk: {
-            const elapsed = std.time.milliTimestamp() - last_pty_output_ms;
-            break :blk @intCast(@max(0, SNAPSHOT_COALESCE_MS - elapsed));
-        } else -1;
+        var poll_timeout: c_int = -1;
+        const now = std.time.milliTimestamp();
+        for (terminals.items) |session| {
+            if (!session.pending_snapshot) continue;
+            const elapsed = now - session.last_pty_output_ms;
+            const remaining: c_int = @intCast(@max(0, SNAPSHOT_COALESCE_MS - elapsed));
+            if (poll_timeout < 0 or remaining < poll_timeout) poll_timeout = remaining;
+        }
+
+        const nfds: c.nfds_t = @intCast(poll_index);
         const ready = c.poll(&pollfds, nfds, poll_timeout);
         if (ready < 0) {
             if (c.__error().* == c.EINTR) continue;
@@ -823,97 +984,142 @@ pub fn main() !void {
         }
 
         if (ready == 0) {
-            if (pending_snapshot) {
-                try broadcastSnapshot(alloc, &clients, &terminal, &render);
-                pending_snapshot = false;
+            for (terminals.items) |session| {
+                if (session.pending_snapshot and std.time.milliTimestamp() - session.last_pty_output_ms >= SNAPSHOT_COALESCE_MS) {
+                    try broadcastSnapshot(alloc, session);
+                    session.pending_snapshot = false;
+                }
             }
             continue;
         }
 
-        if ((pollfds[0].revents & c.POLLIN) != 0 and clients.items.len < MAX_CLIENTS) {
-            acceptClient(alloc, listen_fd, &clients, &terminal, &render) catch {};
+        if ((pollfds[0].revents & c.POLLIN) != 0) {
+            acceptClient(alloc, listen_fd, &terminals) catch {};
         }
 
-        if ((pollfds[1].revents & c.POLLIN) != 0) {
+        for (polled_sessions[0..session_count], 0..) |session, session_index| {
+            if ((pollfds[1 + session_index].revents & c.POLLIN) == 0) continue;
             while (true) {
-                const n = c.read(pty_fd, &pty_buf, pty_buf.len);
+                const n = c.read(session.pty_fd, &pty_buf, pty_buf.len);
                 if (n < 0) {
                     if (c.__error().* == c.EAGAIN) break;
                     return error.PtyReadFailed;
                 }
-                if (n == 0) return;
-                if (pending_resize) |size| {
-                    try terminal.resize(alloc, size.cols, size.rows);
-                    pending_resize = null;
+                if (n == 0) break;
+                if (session.pending_resize) |size| {
+                    try session.terminal.resize(alloc, size.cols, size.rows);
+                    session.pending_resize = null;
                 }
-                try stream.nextSlice(pty_buf[0..@intCast(n)]);
+                try session.stream.nextSlice(pty_buf[0..@intCast(n)]);
                 if (n < pty_buf.len) break;
             }
-            pending_snapshot = true;
-            last_pty_output_ms = std.time.milliTimestamp();
+            session.pending_snapshot = true;
+            session.last_pty_output_ms = std.time.milliTimestamp();
         }
 
-        var idx: usize = 0;
-        while (idx < polled_clients and idx < clients.items.len) {
-            const revents = pollfds[2 + idx].revents;
+        var client_poll_index: usize = 0;
+        while (client_poll_index < client_count) {
+            const revents = pollfds[1 + session_count + client_poll_index].revents;
+            const session = polled_client_sessions[client_poll_index];
+            const client_index = polled_client_indexes[client_poll_index];
+            if (client_index >= session.clients.items.len) {
+                client_poll_index += 1;
+                continue;
+            }
             if ((revents & (c.POLLIN | c.POLLHUP | c.POLLERR)) == 0) {
-                idx += 1;
+                client_poll_index += 1;
                 continue;
             }
             if ((revents & (c.POLLHUP | c.POLLERR)) != 0) {
-                const was_writer = clients.items[idx].role == .writer;
-                closeClient(&clients, idx);
-                if (was_writer) broadcastRoles(alloc, &clients);
+                const was_writer = session.clients.items[client_index].role == .writer;
+                closeClient(session, client_index);
+                if (was_writer) broadcastRoles(alloc, session);
                 continue;
             }
-            const frame = readWebsocketFrame(alloc, clients.items[idx].fd) catch {
-                const was_writer = clients.items[idx].role == .writer;
-                closeClient(&clients, idx);
-                if (was_writer) broadcastRoles(alloc, &clients);
+            const client_fd = session.clients.items[client_index].fd;
+            const frame = readWebsocketFrame(alloc, client_fd) catch {
+                const was_writer = session.clients.items[client_index].role == .writer;
+                closeClient(session, client_index);
+                if (was_writer) broadcastRoles(alloc, session);
                 continue;
             };
             const payload = frame orelse {
-                idx += 1;
+                client_poll_index += 1;
                 continue;
             };
             defer alloc.free(payload);
             const msg = decodeClientMessage(payload) catch .unknown;
             switch (msg) {
-                .claim_writer => {
-                    claimWriter(&clients, idx);
-                    broadcastRoles(alloc, &clients);
+                .claim_writer => |claim| {
+                    if (claim.terminal_id == session.id) {
+                        claimWriter(session, client_index);
+                        broadcastRoles(alloc, session);
+                        broadcastTerminals(alloc, &terminals);
+                    }
                 },
                 .input => |input| {
-                    if (clients.items[idx].role == .writer) try writeAllFd(pty_fd, input.data);
+                    if (input.terminal_id == session.id and session.clients.items[client_index].role == .writer) {
+                        try writeAllFd(session.pty_fd, input.data);
+                    }
                 },
                 .resize => |size| {
-                    if (clients.items[idx].role == .writer) {
-                        try resizePty(pty_fd, size.cols, size.rows);
-                        pending_resize = .{ .cols = size.cols, .rows = size.rows };
+                    if (size.terminal_id == session.id and session.clients.items[client_index].role == .writer) {
+                        try resizePty(session.pty_fd, size.cols, size.rows);
+                        session.pending_resize = .{ .cols = size.cols, .rows = size.rows };
                     }
                 },
                 .scroll => |scroll| {
-                    if (clients.items[idx].role == .writer and !terminal.modes.get(.mouse_event_x10) and
-                        !terminal.modes.get(.mouse_event_normal) and
-                        !terminal.modes.get(.mouse_event_button) and
-                        !terminal.modes.get(.mouse_event_any))
+                    if (scroll.terminal_id == session.id and session.clients.items[client_index].role == .writer and !session.terminal.modes.get(.mouse_event_x10) and
+                        !session.terminal.modes.get(.mouse_event_normal) and
+                        !session.terminal.modes.get(.mouse_event_button) and
+                        !session.terminal.modes.get(.mouse_event_any))
                     {
                         const delta: isize = switch (scroll.direction) {
                             .up => -@as(isize, @intCast(scroll.rows)),
                             .down => @as(isize, @intCast(scroll.rows)),
                         };
-                        terminal.screens.active.scroll(.{ .delta_row = delta });
-                        try broadcastSnapshot(alloc, &clients, &terminal, &render);
+                        session.terminal.screens.active.scroll(.{ .delta_row = delta });
+                        try broadcastSnapshot(alloc, session);
+                    }
+                },
+                .list_terminals => {
+                    sendTerminals(alloc, client_fd, &terminals) catch {};
+                },
+                .create_terminal => |size| {
+                    if (terminals.items.len < MAX_TERMINALS) {
+                        const created = try TerminalSession.create(alloc, next_terminal_id, size.cols, size.rows);
+                        next_terminal_id += 1;
+                        try terminals.append(created);
+                        const created_payload = try encodeTerminalCreated(alloc, created);
+                        defer alloc.free(created_payload);
+                        sendWebsocket(client_fd, created_payload) catch {};
+                        broadcastTerminals(alloc, &terminals);
+                    }
+                },
+                .close_terminal => |close| {
+                    if (close.terminal_id != DEFAULT_TERMINAL_ID) {
+                        if (findSession(&terminals, close.terminal_id)) |target| {
+                            for (terminals.items, 0..) |candidate, terminal_index| {
+                                if (candidate == target) {
+                                    _ = terminals.swapRemove(terminal_index);
+                                    target.deinit(alloc);
+                                    broadcastTerminals(alloc, &terminals);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 },
                 .unknown => {},
             }
-            idx += 1;
+            client_poll_index += 1;
         }
 
-        if (pending_snapshot and std.time.milliTimestamp() - last_pty_output_ms >= SNAPSHOT_COALESCE_MS) {
-            try broadcastSnapshot(alloc, &clients, &terminal, &render);
-            pending_snapshot = false;
+        for (terminals.items) |session| {
+            if (session.pending_snapshot and std.time.milliTimestamp() - session.last_pty_output_ms >= SNAPSHOT_COALESCE_MS) {
+                try broadcastSnapshot(alloc, session);
+                session.pending_snapshot = false;
+            }
         }
     }
 }

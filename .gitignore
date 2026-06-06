@@ -1,7 +1,6 @@
 zig-out/
 .zig-cache/
 *.wasm
-!packages/@wterm/core/wasm/wterm.wasm
 .DS_Store
 node_modules/
 .pnpm-store/
@@ -9,11 +8,8 @@ dist/
 *.tsbuildinfo
 .next/
 next-env.d.ts
-packages/@wterm/core/src/wasm-inline.ts
 coverage/
 test-results/
-src/embedded_assets.zig
-src/embedded_asset_files/
 
 # env files
 .env*

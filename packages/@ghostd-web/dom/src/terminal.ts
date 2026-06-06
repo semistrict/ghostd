@@ -98,8 +98,6 @@ export class GhostdWebTerminal {
 
       if (this.autoResize) {
         this._setupResizeObserver();
-      } else {
-        this._lockHeight();
       }
 
       this.input.focus();
@@ -213,20 +211,6 @@ export class GhostdWebTerminal {
     if (response !== null && this.onData) {
       this.onData(response);
     }
-  }
-
-  private _lockHeight(): void {
-    const rh = this._rowHeight || 17;
-    const gridHeight = this.rows * rh;
-    const cs = getComputedStyle(this.element);
-    let extra =
-      (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
-    if (cs.boxSizing === "border-box") {
-      extra +=
-        (parseFloat(cs.borderTopWidth) || 0) +
-        (parseFloat(cs.borderBottomWidth) || 0);
-    }
-    this.element.style.height = `${gridHeight + extra}px`;
   }
 
   private _setRowHeight(): void {

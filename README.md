@@ -76,6 +76,16 @@ pnpm native:test
 pnpm e2e
 ```
 
+Direct Zig build:
+
+```bash
+sh scripts/zig-015.sh build
+./zig-out/bin/ghostd --port 7341
+```
+
+Plain `zig build` also works when `zig` on `PATH` is Zig 0.15.x. Ghostty 1.3.1
+does not build with Zig 0.16.
+
 ## Test Artifacts
 
 The Playwright tests write decoded frontend/WebSocket traces under
@@ -85,8 +95,9 @@ The Playwright tests write decoded frontend/WebSocket traces under
 
 `pnpm build:web` builds `web/` with Vite, scans `web/dist/`, and generates
 `src/embedded_assets.zig` plus copied embed files under
-`src/embedded_asset_files/`. Those generated files are ignored by git and are
-rebuilt before native build/run/test commands.
+`src/embedded_asset_files/`. Those generated files are checked in so the Zig
+binary can be built directly without pnpm. Regenerate them after changing
+anything under `web/`.
 
 ## License
 

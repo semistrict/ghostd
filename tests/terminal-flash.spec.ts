@@ -221,6 +221,12 @@ function decodedType(entry: TraceEntry): unknown {
         return "claimWriter";
       case 4:
         return "scroll";
+      case 5:
+        return "listTerminals";
+      case 6:
+        return "createTerminal";
+      case 7:
+        return "closeTerminal";
       default:
         return null;
     }
@@ -228,6 +234,10 @@ function decodedType(entry: TraceEntry): unknown {
   if (typeof entry.decoded !== "object" || entry.decoded === null) return null;
   if (!("type" in entry.decoded)) return null;
   return entry.decoded.type;
+}
+
+async function terminalText(page: import("@playwright/test").Page): Promise<string> {
+  return page.locator("#terminal").textContent();
 }
 
 function decodedData(entry: TraceEntry): unknown {
@@ -282,6 +292,26 @@ test("typing trace records frontend activity and all websocket messages", async 
   expect(sends.length, "client websocket messages").toBeGreaterThan(0);
   expect(mutations.length, "terminal DOM mutations").toBeGreaterThan(0);
   expect(resizeAfterTyping, "typing must not trigger resize churn").toHaveLength(0);
+});
+
+test("writer terminal fills the available viewport height", async ({ page }) => {
+  await setupTracedPage(page);
+  await expect(page.locator("#status")).toHaveText("writer");
+
+  const expectedRows = await page.evaluate(() => {
+    const terminal = document.querySelector<HTMLElement>("#terminal");
+    if (!terminal) throw new Error("missing terminal");
+    const style = getComputedStyle(terminal);
+    const padding =
+      Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+    const rowHeight =
+      Number.parseFloat(style.getPropertyValue("--term-row-height")) || 17;
+    return Math.floor((terminal.clientHeight - padding) / rowHeight);
+  });
+
+  await expect
+    .poll(async () => page.locator("#terminal .term-row").count())
+    .toBeGreaterThanOrEqual(expectedRows - 1);
 });
 
 test("stealing writer keeps terminal visible and does not cause delayed resize churn", async ({
@@ -342,4 +372,42 @@ test("stealing writer keeps terminal visible and does not cause delayed resize c
 
   await writerPage.close();
   await readerPage.close();
+});
+
+test("tabbed terminals keep independent PTY state", async ({ page }) => {
+  await setupTracedPage(page);
+
+  await expect(page.locator('[data-terminal-tab="0"]')).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+
+  await page.locator("#terminal").click();
+  await page.keyboard.type("echo ghostd-terminal-zero");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#terminal")).toContainText("ghostd-terminal-zero");
+
+  await page.locator("#new-terminal").click();
+  const tabOne = page.locator('[data-terminal-tab="1"]');
+  await expect(tabOne).toBeVisible();
+  await expect(tabOne).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#terminal .term-row").first()).toContainText("%");
+
+  await page.locator("#terminal").click();
+  await page.keyboard.type("echo ghostd-terminal-one");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#terminal")).toContainText("ghostd-terminal-one");
+  await expect(page.locator("#terminal")).not.toContainText("ghostd-terminal-zero");
+
+  await page.locator('[data-terminal-tab="0"]').click();
+  await expect(page.locator('[data-terminal-tab="0"]')).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(page.locator("#terminal")).toContainText("ghostd-terminal-zero");
+  expect(await terminalText(page)).not.toContain("ghostd-terminal-one");
+
+  await page.locator('[data-terminal-tab="1"]').click();
+  await expect(page.locator("#terminal")).toContainText("ghostd-terminal-one");
+  expect(await terminalText(page)).not.toContain("ghostd-terminal-zero");
 });
