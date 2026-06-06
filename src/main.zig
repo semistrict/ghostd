@@ -797,6 +797,20 @@ fn parsePort(args: []const []const u8) u16 {
     return 7341;
 }
 
+fn parseHost(args: []const []const u8) []const u8 {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+            return args[i + 1];
+        }
+        if (std.mem.startsWith(u8, args[i], "--host=")) {
+            return args[i]["--host=".len..];
+        }
+    }
+    if (std.posix.getenv("HOST")) |host| return host;
+    return "127.0.0.1";
+}
+
 fn wantsHelp(args: []const []const u8) bool {
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
@@ -810,10 +824,11 @@ fn printUsage() !void {
     const stdout = &stdout_writer.interface;
 
     try stdout.writeAll(
-        \\Usage: ghostd [--port PORT]
+        \\Usage: ghostd [--host HOST] [--port PORT]
         \\
         \\Options:
         \\  -h, --help     Show this help message.
+        \\  --host HOST    Listen on HOST (default: 127.0.0.1, or HOST env var).
         \\  --port PORT    Listen on PORT (default: 7341, or PORT env var).
         \\
     );
@@ -845,7 +860,7 @@ fn writeAllFd(fd: c_int, data: []const u8) !void {
     }
 }
 
-fn createListenSocket(port: u16) !c_int {
+fn createListenSocket(host: []const u8, port: u16) !c_int {
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = c.close(fd);
@@ -856,7 +871,13 @@ fn createListenSocket(port: u16) !c_int {
     var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
     addr.sin_family = c.AF_INET;
     addr.sin_port = c.htons(port);
-    addr.sin_addr.s_addr = c.htonl(c.INADDR_LOOPBACK);
+    if (std.mem.eql(u8, host, "0.0.0.0")) {
+        addr.sin_addr.s_addr = c.htonl(c.INADDR_ANY);
+    } else if (std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "localhost")) {
+        addr.sin_addr.s_addr = c.htonl(c.INADDR_LOOPBACK);
+    } else {
+        return error.UnsupportedHost;
+    }
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) < 0) return error.BindFailed;
     if (c.listen(fd, 32) < 0) return error.ListenFailed;
     try setNonblocking(fd);
@@ -1278,8 +1299,9 @@ pub fn main() !void {
         return;
     }
     const port = parsePort(args);
+    const host = parseHost(args);
 
-    const listen_fd = try createListenSocket(port);
+    const listen_fd = try createListenSocket(host, port);
     defer _ = c.close(listen_fd);
 
     var terminals = std.array_list.Managed(*TerminalSession).init(alloc);
@@ -1290,7 +1312,7 @@ pub fn main() !void {
     try terminals.append(try TerminalSession.create(alloc, DEFAULT_TERMINAL_ID, DEFAULT_COLS, DEFAULT_ROWS));
     var next_terminal_id: u32 = 1;
 
-    std.debug.print("ghostd native listening on http://127.0.0.1:{d}\n", .{port});
+    std.debug.print("ghostd native listening on http://{s}:{d}\n", .{ host, port });
 
     var pty_buf: [8192]u8 = undefined;
     while (true) {
