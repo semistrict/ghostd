@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     exe.linkLibC();
+    if (exe.rootModuleTarget().os.tag == .linux) {
+        exe.addSystemIncludePath(.{ .cwd_relative = "/usr/include/bsd" });
+        exe.linkSystemLibrary("bsd");
+    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run ghostd");
