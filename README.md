@@ -4,9 +4,11 @@
 It keeps one long-lived PTY on the server and lets browser tabs reconnect as
 readers or claim the single writer role.
 
-This repository is now laid out as a Zig project with a TypeScript browser
-client in `web/`. The remaining `@wterm/*` packages are local support packages
-used by the browser client; they are not separate applications.
+This repository is laid out as a Zig project with a TypeScript browser client
+in `web/`. The browser assets are built and embedded into the native binary, so
+the daemon can serve the client itself. The remaining `@wterm/*` packages are
+local support packages used by the browser client; they are not separate
+applications.
 
 ## What It Does
 
@@ -19,14 +21,17 @@ used by the browser client; they are not separate applications.
 - Includes Playwright regressions that log frontend activity, DOM mutations,
   and decoded WebSocket messages.
 
-## Workspace Packages
+Current scope: one terminal session per daemon process.
+
+## Layout
 
 - `src/` - Zig daemon source.
 - `web/` - browser client source and Vite build.
 - `tests/` - Playwright e2e tests.
-- `@wterm/dom` (`packages/@wterm/dom`) - local DOM renderer/input package.
-- `@wterm/core` (`packages/@wterm/core`) - local renderer core types/WASM bridge.
-- `@internal/ts` (`packages/@internal/ts`) - shared TypeScript config.
+- `scripts/` - build helpers, asset embedding, and portless wrapper.
+- `packages/@wterm/dom` - local DOM renderer/input package.
+- `packages/@wterm/core` - local renderer core types and terminal helpers.
+- `packages/@internal/ts` - shared TypeScript config.
 
 ## Requirements
 
@@ -56,7 +61,8 @@ https://ghostd.wterm.localhost
 
 ```bash
 pnpm dev          # build and run ghostd through portless
-pnpm build        # build the browser client
+pnpm build        # build local TS packages, web client, and embedded assets
+pnpm build:web    # build web/ and regenerate embedded asset sources
 pnpm type-check   # type-check all TypeScript packages
 pnpm test         # DOM tests, native tests, and Playwright e2e tests
 pnpm e2e          # Playwright e2e tests only
