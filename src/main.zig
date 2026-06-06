@@ -808,8 +808,8 @@ fn writeAllFd(fd: c_int, data: []const u8) !void {
     while (off < data.len) {
         const written = c.write(fd, data.ptr + off, data.len - off);
         if (written < 0) {
-            if (c.__error().* == c.EINTR) continue;
-            if (c.__error().* == c.EAGAIN) {
+            if (std.posix.errno(-1) == .INTR) continue;
+            if (std.posix.errno(-1) == .AGAIN) {
                 var pfd: c.struct_pollfd = .{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
                 const ready = c.poll(&pfd, 1, 1000);
                 if (ready > 0) continue;
@@ -1166,7 +1166,7 @@ fn readWebsocketFrame(alloc: std.mem.Allocator, fd: c_int) !?[]u8 {
     const got = c.read(fd, &header, 2);
     if (got == 0) return error.Closed;
     if (got < 0) {
-        if (c.__error().* == c.EAGAIN) return null;
+        if (std.posix.errno(-1) == .AGAIN) return null;
         return error.ReadFailed;
     }
     if (got != 2) return error.ReadFailed;
@@ -1306,7 +1306,7 @@ pub fn main() !void {
         const nfds: c.nfds_t = @intCast(poll_index);
         const ready = c.poll(&pollfds, nfds, poll_timeout);
         if (ready < 0) {
-            if (c.__error().* == c.EINTR) continue;
+            if (std.posix.errno(-1) == .INTR) continue;
             return error.PollFailed;
         }
 
@@ -1329,7 +1329,7 @@ pub fn main() !void {
             while (true) {
                 const n = c.read(session.pty_fd, &pty_buf, pty_buf.len);
                 if (n < 0) {
-                    if (c.__error().* == c.EAGAIN) break;
+                    if (std.posix.errno(-1) == .AGAIN) break;
                     return error.PtyReadFailed;
                 }
                 if (n == 0) break;

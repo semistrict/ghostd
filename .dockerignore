@@ -1,0 +1,6 @@
+.git
+.zig-cache
+node_modules
+test-results
+web/dist
+zig-out
