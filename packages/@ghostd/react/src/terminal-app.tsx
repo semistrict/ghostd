@@ -72,6 +72,7 @@ export function GhostdTerminalApp({
   const terminalRef = useRef<GhostdWebTerminal | null>(null);
   const activeTerminalIdRef = useRef<TerminalId>(initialTerminalId);
   const pendingCreatedTerminalRef = useRef(false);
+  const scrollToBottomOnUpdateRef = useRef(true);
   const sizeRef = useRef<SizeState>({
     lastSentCols: cols,
     lastSentRows: rows,
@@ -220,6 +221,7 @@ export function GhostdTerminalApp({
       if (disposed) return;
       setCurrentTerminalId(terminalId);
       setConnectionState("connecting");
+      scrollToBottomOnUpdateRef.current = true;
       core.connect(terminalUrl(terminalId));
     }
 
@@ -281,6 +283,12 @@ export function GhostdTerminalApp({
       }
 
       terminal.write(new Uint8Array());
+      if (scrollToBottomOnUpdateRef.current) {
+        scrollToBottomOnUpdateRef.current = false;
+        requestAnimationFrame(() => {
+          terminalElement.scrollTop = terminalElement.scrollHeight;
+        });
+      }
     };
 
     core.onRoleChange = (nextRole) => {
@@ -366,6 +374,7 @@ export function GhostdTerminalApp({
   function handleSwitchTerminal(terminalId: TerminalId) {
     setCurrentTerminalId(terminalId);
     setConnectionState("connecting");
+    scrollToBottomOnUpdateRef.current = true;
     coreRef.current?.connect(
       ghostdTerminalWebSocketUrl(resolveBaseUrl(baseUrlValue), terminalId),
     );
