@@ -285,9 +285,11 @@ export function GhostdTerminalApp({
       terminal.write(new Uint8Array());
       if (scrollToBottomOnUpdateRef.current) {
         scrollToBottomOnUpdateRef.current = false;
-        requestAnimationFrame(() => {
-          terminalElement.scrollTop = terminalElement.scrollHeight;
-        });
+        window.setTimeout(() => {
+          requestAnimationFrame(() => {
+            terminalElement.scrollTop = terminalElement.scrollHeight;
+          });
+        }, 0);
       }
     };
 
