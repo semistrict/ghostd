@@ -1,5 +1,6 @@
 const std = @import("std");
 const vt = @import("ghostty-vt");
+const StreamAction = vt.StreamAction;
 const embedded_assets = @import("embedded_assets.zig");
 
 const c = @cImport({
@@ -23,6 +24,8 @@ const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: usize = 64;
 const MAX_TERMINALS: usize = 16;
+const MAX_TITLE_BYTES: usize = 256;
+const MAX_PWD_BYTES: usize = 512;
 const SNAPSHOT_COALESCE_MS: i64 = 16;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_TERMINAL_ID: u32 = 0;
@@ -55,6 +58,11 @@ const WireRole = enum(u8) {
 const ScrollDirection = enum(u8) {
     up = 0,
     down = 1,
+};
+
+const TerminalContentFormat = enum {
+    html,
+    text,
 };
 
 const Cell = struct {
@@ -105,13 +113,43 @@ const Client = struct {
     terminal_id: u32,
 };
 
+const TitleStream = vt.Stream(TitleStreamHandler);
+
+const TitleStreamHandler = struct {
+    session: *TerminalSession,
+
+    pub fn deinit(self: *TitleStreamHandler) void {
+        _ = self;
+    }
+
+    pub fn vt(
+        self: *TitleStreamHandler,
+        comptime action: StreamAction.Tag,
+        value: StreamAction.Value(action),
+    ) !void {
+        if (action == .window_title) {
+            if (self.session.setTitle(value.title)) self.session.metadata_changed = true;
+        } else if (action == .report_pwd) {
+            if (self.session.setPwd(value.url)) self.session.metadata_changed = true;
+        }
+
+        var readonly = self.session.terminal.vtHandler();
+        try readonly.vt(action, value);
+    }
+};
+
 const TerminalSession = struct {
     id: u32,
     pty_fd: c_int,
     terminal: vt.Terminal,
-    stream: vt.ReadonlyStream,
+    stream: TitleStream,
     render: vt.RenderState,
     clients: std.array_list.Managed(Client),
+    title: [MAX_TITLE_BYTES]u8 = undefined,
+    title_len: usize = 0,
+    pwd: [MAX_PWD_BYTES]u8 = undefined,
+    pwd_len: usize = 0,
+    metadata_changed: bool = false,
     pending_resize: ?struct { cols: u16, rows: u16 } = null,
     pending_snapshot: bool = false,
     last_pty_output_ms: i64 = 0,
@@ -128,10 +166,13 @@ const TerminalSession = struct {
             .max_scrollback = 10 * 1024 * 1024,
         });
         errdefer session.terminal.deinit(alloc);
-        session.stream = session.terminal.vtStream();
+        session.stream = TitleStream.initAlloc(alloc, .{ .session = session });
         errdefer session.stream.deinit();
         session.render = .empty;
         session.clients = std.array_list.Managed(Client).init(alloc);
+        session.title_len = 0;
+        session.pwd_len = 0;
+        session.metadata_changed = false;
         session.pending_resize = null;
         session.pending_snapshot = false;
         session.last_pty_output_ms = 0;
@@ -147,6 +188,34 @@ const TerminalSession = struct {
         self.terminal.deinit(alloc);
         if (self.pty_fd >= 0) _ = c.close(self.pty_fd);
         alloc.destroy(self);
+    }
+
+    fn titleSlice(self: *const TerminalSession) ?[]const u8 {
+        if (self.title_len == 0) return null;
+        return self.title[0..self.title_len];
+    }
+
+    fn pwdSlice(self: *const TerminalSession) ?[]const u8 {
+        if (self.pwd_len == 0) return null;
+        return self.pwd[0..self.pwd_len];
+    }
+
+    fn setTitle(self: *TerminalSession, title: []const u8) bool {
+        const trimmed = std.mem.trim(u8, title, " \t\r\n");
+        const len = @min(trimmed.len, self.title.len);
+        if (self.title_len == len and std.mem.eql(u8, self.title[0..len], trimmed[0..len])) return false;
+        if (len > 0) @memcpy(self.title[0..len], trimmed[0..len]);
+        self.title_len = len;
+        return true;
+    }
+
+    fn setPwd(self: *TerminalSession, url: []const u8) bool {
+        const path = pwdPathFromUrl(url);
+        const len = @min(path.len, self.pwd.len);
+        if (self.pwd_len == len and std.mem.eql(u8, self.pwd[0..len], path[0..len])) return false;
+        if (len > 0) @memcpy(self.pwd[0..len], path[0..len]);
+        self.pwd_len = len;
+        return true;
     }
 };
 
@@ -407,9 +476,18 @@ fn encodeTerminals(alloc: std.mem.Allocator, terminals: *std.array_list.Managed(
                 break;
             }
         }
-        try writer.array(6);
+        try writer.array(7);
         try writer.uint(session.id);
-        try writer.nilValue();
+        if (session.titleSlice()) |title| {
+            try writer.str(title);
+        } else {
+            try writer.nilValue();
+        }
+        if (session.pwdSlice()) |pwd| {
+            try writer.str(pwd);
+        } else {
+            try writer.nilValue();
+        }
         try writer.uint(session.terminal.cols);
         try writer.uint(session.terminal.rows);
         try writer.uint(@intFromEnum(WireRole.reader));
@@ -423,14 +501,141 @@ fn encodeTerminalCreated(alloc: std.mem.Allocator, session: *TerminalSession) ![
     errdefer writer.deinit();
     try writer.array(2);
     try writer.uint(@intFromEnum(ServerOpcode.terminal_created));
-    try writer.array(6);
+    try writer.array(7);
     try writer.uint(session.id);
-    try writer.nilValue();
+    if (session.titleSlice()) |title| {
+        try writer.str(title);
+    } else {
+        try writer.nilValue();
+    }
+    if (session.pwdSlice()) |pwd| {
+        try writer.str(pwd);
+    } else {
+        try writer.nilValue();
+    }
     try writer.uint(session.terminal.cols);
     try writer.uint(session.terminal.rows);
     try writer.uint(@intFromEnum(WireRole.reader));
     try writer.boolValue(false);
     return writer.buf.toOwnedSlice();
+}
+
+fn appendCodepoint(buf: *std.array_list.Managed(u8), codepoint: u32) !void {
+    const scalar = if (codepoint == 0) 32 else codepoint;
+    if (scalar > 0x10ffff) {
+        try buf.appendSlice("\xef\xbf\xbd");
+        return;
+    }
+    var encoded: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(@as(u21, @intCast(scalar)), &encoded) catch {
+        try buf.appendSlice("\xef\xbf\xbd");
+        return;
+    };
+    try buf.appendSlice(encoded[0..len]);
+}
+
+fn appendHtmlEscapedCodepoint(buf: *std.array_list.Managed(u8), codepoint: u32) !void {
+    switch (if (codepoint == 0) 32 else codepoint) {
+        '&' => try buf.appendSlice("&amp;"),
+        '<' => try buf.appendSlice("&lt;"),
+        '>' => try buf.appendSlice("&gt;"),
+        '"' => try buf.appendSlice("&quot;"),
+        '\'' => try buf.appendSlice("&#39;"),
+        else => |cp| try appendCodepoint(buf, cp),
+    }
+}
+
+fn appendJsonString(buf: *std.array_list.Managed(u8), value: []const u8) !void {
+    try buf.append('"');
+    for (value) |byte| {
+        switch (byte) {
+            '\\' => try buf.appendSlice("\\\\"),
+            '"' => try buf.appendSlice("\\\""),
+            '\n' => try buf.appendSlice("\\n"),
+            '\r' => try buf.appendSlice("\\r"),
+            '\t' => try buf.appendSlice("\\t"),
+            0...8, 11...12, 14...0x1f => try buf.writer().print("\\u{x:0>4}", .{byte}),
+            else => try buf.append(byte),
+        }
+    }
+    try buf.append('"');
+}
+
+fn appendHexColor(buf: *std.array_list.Managed(u8), rgb: u24) !void {
+    try buf.writer().print("#{x:0>6}", .{rgb});
+}
+
+fn appendCellStyle(buf: *std.array_list.Managed(u8), cell: Cell) !bool {
+    const has_style = cell.fg_rgb != null or cell.bg_rgb != null or cell.flags != 0;
+    if (!has_style) return false;
+
+    try buf.appendSlice("<span style=\"");
+    if (cell.fg_rgb) |rgb| {
+        try buf.appendSlice("color:");
+        try appendHexColor(buf, rgb);
+        try buf.appendSlice(";");
+    }
+    if (cell.bg_rgb) |rgb| {
+        try buf.appendSlice("background-color:");
+        try appendHexColor(buf, rgb);
+        try buf.appendSlice(";");
+    }
+    if ((cell.flags & 0x01) != 0) try buf.appendSlice("font-weight:700;");
+    if ((cell.flags & 0x02) != 0) try buf.appendSlice("opacity:.7;");
+    if ((cell.flags & 0x04) != 0) try buf.appendSlice("font-style:italic;");
+    if ((cell.flags & 0x08) != 0) try buf.appendSlice("text-decoration:underline;");
+    if ((cell.flags & 0x80) != 0) try buf.appendSlice("text-decoration:line-through;");
+    try buf.appendSlice("\">");
+    return true;
+}
+
+fn snapshotText(alloc: std.mem.Allocator, snap: Snapshot) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+
+    for (0..snap.rows) |row| {
+        const start = row * @as(usize, snap.cols);
+        var end = start + snap.cols;
+        while (end > start) {
+            const cell = snap.cells[end - 1];
+            const char = if (cell.char == 0) 32 else cell.char;
+            if (char != 32) break;
+            end -= 1;
+        }
+        for (snap.cells[start..end]) |cell| try appendCodepoint(&out, cell.char);
+        if (row + 1 < snap.rows) try out.append('\n');
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn snapshotHtml(alloc: std.mem.Allocator, terminal_id: u32, snap: Snapshot) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+
+    try out.writer().print(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>ghostd terminal {d}</title><style>body{{margin:0;background:#1e1e1e;color:#d4d4d4}}pre{{margin:0;padding:12px;font:14px/17px Menlo,Consolas,monospace;white-space:pre}}</style></head><body><pre>",
+        .{terminal_id},
+    );
+    for (0..snap.rows) |row| {
+        const start = row * @as(usize, snap.cols);
+        var end = start + snap.cols;
+        while (end > start) {
+            const cell = snap.cells[end - 1];
+            const char = if (cell.char == 0) 32 else cell.char;
+            if (char != 32 or cell.bg_rgb != null) break;
+            end -= 1;
+        }
+        for (snap.cells[start..end]) |cell| {
+            const styled = try appendCellStyle(&out, cell);
+            try appendHtmlEscapedCodepoint(&out, cell.char);
+            if (styled) try out.appendSlice("</span>");
+        }
+        if (row + 1 < snap.rows) try out.append('\n');
+    }
+    try out.appendSlice("</pre></body></html>");
+
+    return out.toOwnedSlice();
 }
 
 const MsgpackReader = struct {
@@ -684,11 +889,15 @@ fn websocketAccept(alloc: std.mem.Allocator, key: []const u8) ![]u8 {
     return out;
 }
 
-fn sendHttp(fd: c_int, status: []const u8, body: []const u8) !void {
+fn sendHttpContent(fd: c_int, status: []const u8, content_type: []const u8, body: []const u8) !void {
     var header: [256]u8 = undefined;
-    const text = try std.fmt.bufPrint(&header, "HTTP/1.1 {s}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, body.len });
+    const text = try std.fmt.bufPrint(&header, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, content_type, body.len });
     try writeAllFd(fd, text);
     try writeAllFd(fd, body);
+}
+
+fn sendHttp(fd: c_int, status: []const u8, body: []const u8) !void {
+    try sendHttpContent(fd, status, "text/plain; charset=utf-8", body);
 }
 
 fn requestPath(request: []const u8) []const u8 {
@@ -701,21 +910,130 @@ fn requestPath(request: []const u8) []const u8 {
     return raw[0..query];
 }
 
-fn requestTerminalId(request: []const u8) u32 {
-    const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
-    const first_line = request[0..first_line_end];
-    var parts = std.mem.splitScalar(u8, first_line, ' ');
-    _ = parts.next();
-    const raw = parts.next() orelse return DEFAULT_TERMINAL_ID;
-    const query_start = std.mem.indexOfScalar(u8, raw, '?') orelse return DEFAULT_TERMINAL_ID;
-    var query = std.mem.splitScalar(u8, raw[query_start + 1 ..], '&');
-    while (query.next()) |part| {
-        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-        if (std.mem.eql(u8, part[0..eq], "id")) {
-            return std.fmt.parseInt(u32, part[eq + 1 ..], 10) catch DEFAULT_TERMINAL_ID;
+fn acceptsHtml(request: []const u8) bool {
+    const accept = findHeader(request, "Accept") orelse return false;
+    if (std.mem.indexOf(u8, accept, "text/html") == null) return false;
+    const text_pos = std.mem.indexOf(u8, accept, "text/plain") orelse return true;
+    const html_pos = std.mem.indexOf(u8, accept, "text/html") orelse return false;
+    return html_pos < text_pos;
+}
+
+fn terminalContentFormat(request: []const u8, path: []const u8) TerminalContentFormat {
+    if (std.mem.endsWith(u8, path, ".html")) return .html;
+    if (std.mem.endsWith(u8, path, ".txt")) return .text;
+    return if (acceptsHtml(request)) .html else .text;
+}
+
+fn terminalIdFromApiPath(path: []const u8) ?u32 {
+    const prefix = "/api/terminals/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    var id_part = path[prefix.len..];
+    if (std.mem.endsWith(u8, id_part, ".html")) id_part = id_part[0 .. id_part.len - ".html".len];
+    if (std.mem.endsWith(u8, id_part, ".txt")) id_part = id_part[0 .. id_part.len - ".txt".len];
+    if (id_part.len == 0) return null;
+    return std.fmt.parseInt(u32, id_part, 10) catch null;
+}
+
+fn terminalIdFromWebsocketPath(path: []const u8) ?u32 {
+    const prefix = "/terminal/";
+    const suffix = ".ws";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (!std.mem.endsWith(u8, path, suffix)) return null;
+    const id_part = path[prefix.len .. path.len - suffix.len];
+    if (id_part.len == 0) return null;
+    return std.fmt.parseInt(u32, id_part, 10) catch null;
+}
+
+fn pwdPathFromUrl(url: []const u8) []const u8 {
+    const file_prefix = "file://";
+    const kitty_prefix = "kitty-shell-cwd://";
+    const raw = if (std.mem.startsWith(u8, url, file_prefix))
+        url[file_prefix.len..]
+    else if (std.mem.startsWith(u8, url, kitty_prefix))
+        url[kitty_prefix.len..]
+    else
+        url;
+    if (raw.len == 0) return raw;
+    if (raw[0] == '/') return raw;
+    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return raw;
+    return raw[slash..];
+}
+
+fn sendTerminalsJson(alloc: std.mem.Allocator, fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
+    var body = std.array_list.Managed(u8).init(alloc);
+    defer body.deinit();
+    try body.appendSlice("{\"terminals\":[");
+    for (terminals.items, 0..) |session, index| {
+        var writer_connected = false;
+        for (session.clients.items) |client| {
+            if (client.role == .writer) {
+                writer_connected = true;
+                break;
+            }
         }
+        if (index > 0) try body.append(',');
+        try body.writer().print(
+            "{{\"id\":{d},\"title\":",
+            .{session.id},
+        );
+        if (session.titleSlice()) |title| {
+            try appendJsonString(&body, title);
+        } else {
+            try body.appendSlice("null");
+        }
+        try body.appendSlice(",\"pwd\":");
+        if (session.pwdSlice()) |pwd| {
+            try appendJsonString(&body, pwd);
+        } else {
+            try body.appendSlice("null");
+        }
+        try body.writer().print(
+            ",\"cols\":{d},\"rows\":{d},\"writerConnected\":{s}}}",
+            .{ session.terminal.cols, session.terminal.rows, if (writer_connected) "true" else "false" },
+        );
     }
-    return DEFAULT_TERMINAL_ID;
+    try body.appendSlice("]}");
+    try sendHttpContent(fd, "200 OK", "application/json; charset=utf-8", body.items);
+}
+
+fn sendTerminalContent(alloc: std.mem.Allocator, fd: c_int, request: []const u8, session: *TerminalSession) !void {
+    const path = requestPath(request);
+    const format = terminalContentFormat(request, path);
+    const snap = try snapshot(alloc, &session.terminal, &session.render);
+    defer alloc.free(snap.cells);
+
+    const body = switch (format) {
+        .html => try snapshotHtml(alloc, session.id, snap),
+        .text => try snapshotText(alloc, snap),
+    };
+    defer alloc.free(body);
+
+    const content_type = switch (format) {
+        .html => "text/html; charset=utf-8",
+        .text => "text/plain; charset=utf-8",
+    };
+    try sendHttpContent(fd, "200 OK", content_type, body);
+}
+
+fn sendApi(alloc: std.mem.Allocator, fd: c_int, request: []const u8, terminals: *std.array_list.Managed(*TerminalSession)) !bool {
+    const path = requestPath(request);
+    if (std.mem.eql(u8, path, "/api/terminals")) {
+        try sendTerminalsJson(alloc, fd, terminals);
+        return true;
+    }
+    if (terminalIdFromApiPath(path)) |terminal_id| {
+        const session = findSession(terminals, terminal_id) orelse {
+            try sendHttp(fd, "404 Not Found", "terminal not found\n");
+            return true;
+        };
+        try sendTerminalContent(alloc, fd, request, session);
+        return true;
+    }
+    if (std.mem.startsWith(u8, path, "/api/")) {
+        try sendHttp(fd, "404 Not Found", "not found\n");
+        return true;
+    }
+    return false;
 }
 
 fn sendStatic(fd: c_int, request: []const u8) !void {
@@ -782,10 +1100,14 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, terminals: *std.arra
     if (n <= 0) return;
     const request = request_buf[0..@intCast(n)];
     const key = findHeader(request, "Sec-WebSocket-Key") orelse {
+        if (try sendApi(alloc, fd, request, terminals)) return;
         try sendStatic(fd, request);
         return;
     };
-    const terminal_id = requestTerminalId(request);
+    const terminal_id = terminalIdFromWebsocketPath(requestPath(request)) orelse {
+        try sendHttp(fd, "404 Not Found", "websocket terminal not found\n");
+        return;
+    };
     const session = findSession(terminals, terminal_id) orelse {
         try sendHttp(fd, "404 Not Found", "terminal not found\n");
         return;
@@ -1013,6 +1335,10 @@ pub fn main() !void {
                 try session.stream.nextSlice(pty_buf[0..@intCast(n)]);
                 if (n < pty_buf.len) break;
             }
+            if (session.metadata_changed) {
+                session.metadata_changed = false;
+                broadcastTerminals(alloc, &terminals);
+            }
             session.pending_snapshot = true;
             session.last_pty_output_ms = std.time.milliTimestamp();
         }
@@ -1184,4 +1510,53 @@ test "decodes compact client protocol messages" {
     try std.testing.expectEqual(@as(u32, 42), scroll_msg.scroll.terminal_id);
     try std.testing.expectEqual(@as(u16, 3), scroll_msg.scroll.rows);
     try std.testing.expectEqual(ScrollDirection.up, scroll_msg.scroll.direction);
+}
+
+test "terminal REST content format uses extension before accept header" {
+    const html_request = "GET /api/terminals/7 HTTP/1.1\r\nAccept: text/html\r\n\r\n";
+    const text_request = "GET /api/terminals/7.html HTTP/1.1\r\nAccept: text/plain\r\n\r\n";
+    const plain_request = "GET /api/terminals/7.txt HTTP/1.1\r\nAccept: text/html\r\n\r\n";
+
+    try std.testing.expectEqual(@as(?u32, 7), terminalIdFromApiPath("/api/terminals/7"));
+    try std.testing.expectEqual(@as(?u32, 7), terminalIdFromApiPath("/api/terminals/7.html"));
+    try std.testing.expectEqual(@as(?u32, 7), terminalIdFromApiPath("/api/terminals/7.txt"));
+    try std.testing.expectEqual(TerminalContentFormat.html, terminalContentFormat(html_request, "/api/terminals/7"));
+    try std.testing.expectEqual(TerminalContentFormat.html, terminalContentFormat(text_request, "/api/terminals/7.html"));
+    try std.testing.expectEqual(TerminalContentFormat.text, terminalContentFormat(plain_request, "/api/terminals/7.txt"));
+}
+
+test "terminal websocket path carries terminal id" {
+    try std.testing.expectEqual(@as(?u32, 0), terminalIdFromWebsocketPath("/terminal/0.ws"));
+    try std.testing.expectEqual(@as(?u32, 42), terminalIdFromWebsocketPath("/terminal/42.ws"));
+    try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/api/terminal?id=42"));
+    try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/terminal/42"));
+    try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/terminal/nope.ws"));
+}
+
+test "terminal REST renderers emit text and escaped html" {
+    const alloc = std.testing.allocator;
+    var cells = [_]Cell{
+        .{ .char = 'o' },
+        .{ .char = 'k' },
+        .{ .char = '<', .fg_rgb = 0xff0000, .flags = 0x01 },
+        .{ .char = ' ' },
+    };
+    const snap: Snapshot = .{
+        .cols = 4,
+        .rows = 1,
+        .cursor_row = 0,
+        .cursor_col = 0,
+        .cursor_visible = false,
+        .mouse_reporting = false,
+        .cells = &cells,
+    };
+
+    const text = try snapshotText(alloc, snap);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("ok<", text);
+
+    const html = try snapshotHtml(alloc, 2, snap);
+    defer alloc.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "ghostd terminal 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "ok<span style=\"color:#ff0000;font-weight:700;\">&lt;</span>") != null);
 }

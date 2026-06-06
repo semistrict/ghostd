@@ -32,6 +32,7 @@ let terminals = new Map<TerminalId, TerminalSummary>([
     {
       terminalId: 0,
       title: null,
+      pwd: null,
       cols: 80,
       rows: 24,
       role: "reader",
@@ -41,7 +42,7 @@ let terminals = new Map<TerminalId, TerminalSummary>([
 ]);
 const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
 const terminalUrl = (terminalId: TerminalId) =>
-  `${proto}//${window.location.host}/api/terminal?id=${terminalId}`;
+  `${proto}//${window.location.host}/terminal/${terminalId}.ws`;
 
 function measureCellSize(): {
   grid: HTMLElement;
@@ -107,6 +108,11 @@ function syncWriterSize(options: { force?: boolean } = {}): void {
   term.resize(size.cols, size.rows);
 }
 
+function terminalLabel(terminal: TerminalSummary): string {
+  const title = terminal.title ?? `term ${terminal.terminalId}`;
+  return terminal.pwd ? `${title} ${terminal.pwd}` : title;
+}
+
 function renderTabs(): void {
   tabs.replaceChildren(
     ...Array.from(terminals.values())
@@ -121,7 +127,7 @@ function renderTabs(): void {
           "aria-selected",
           String(terminal.terminalId === activeTerminalId),
         );
-        button.textContent = terminal.title ?? `term ${terminal.terminalId}`;
+        button.textContent = terminalLabel(terminal);
         button.addEventListener("click", () => switchTerminal(terminal.terminalId));
         return button;
       }),

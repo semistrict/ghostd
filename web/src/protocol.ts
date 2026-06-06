@@ -68,6 +68,7 @@ type WirePackedRow = [number, WireCell[]];
 type WireTerminalSummary = [
   TerminalId,
   string | null,
+  string | null,
   number,
   number,
   WireRole,
@@ -82,6 +83,7 @@ export interface PackedRow {
 export interface TerminalSummary {
   terminalId: TerminalId;
   title: string | null;
+  pwd: string | null;
   cols: number;
   rows: number;
   role: ClientRole;
@@ -284,10 +286,11 @@ function decodeTerminalSummary(value: unknown): TerminalSummary {
   return {
     terminalId: numberAt(summary, 0),
     title: summary[1] === null ? null : String(summary[1]),
-    cols: numberAt(summary, 2),
-    rows: numberAt(summary, 3),
-    role: decodeRole(numberAt(summary, 4)),
-    writerConnected: Boolean(summary[5]),
+    pwd: summary[2] === null ? null : String(summary[2]),
+    cols: numberAt(summary, 3),
+    rows: numberAt(summary, 4),
+    role: decodeRole(numberAt(summary, 5)),
+    writerConnected: Boolean(summary[6]),
   };
 }
 

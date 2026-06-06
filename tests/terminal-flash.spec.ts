@@ -283,6 +283,7 @@ test("typing trace records frontend activity and all websocket messages", async 
   const messages = trace.filter((entry) => entry.type === "ws:message");
   const sends = trace.filter((entry) => entry.type === "ws:send");
   const mutations = trace.filter((entry) => entry.type === "dom:mutation");
+  const sockets = trace.filter((entry) => entry.type === "ws:new");
   const firstTypedInputAt = sends.find(
     (entry) => decodedType(entry) === "input" && decodedData(entry) === "e",
   )?.at;
@@ -291,6 +292,9 @@ test("typing trace records frontend activity and all websocket messages", async 
   expect(messages.length, "server websocket messages").toBeGreaterThan(0);
   expect(sends.length, "client websocket messages").toBeGreaterThan(0);
   expect(mutations.length, "terminal DOM mutations").toBeGreaterThan(0);
+  expect(sockets.some((entry) => String(entry.url).endsWith("/terminal/0.ws"))).toBe(
+    true,
+  );
   expect(resizeAfterTyping, "typing must not trigger resize churn").toHaveLength(0);
 });
 
@@ -312,6 +316,94 @@ test("writer terminal fills the available viewport height", async ({ page }) => 
   await expect
     .poll(async () => page.locator("#terminal .term-row").count())
     .toBeGreaterThanOrEqual(expectedRows - 1);
+});
+
+test("REST terminal API returns terminal list plus text and html contents", async ({
+  page,
+}) => {
+  await setupTracedPage(page);
+
+  await page.locator("#terminal").click();
+  await page.keyboard.type("echo ghostd-rest-probe");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#terminal")).toContainText("ghostd-rest-probe");
+
+  const list = await page.request.get("/api/terminals");
+  expect(list.ok()).toBe(true);
+  expect(list.headers()["content-type"]).toContain("application/json");
+  const json = await list.json();
+  expect(json.terminals).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: 0, writerConnected: true }),
+    ]),
+  );
+
+  const textByExtension = await page.request.get("/api/terminals/0.txt");
+  expect(textByExtension.ok()).toBe(true);
+  expect(textByExtension.headers()["content-type"]).toContain("text/plain");
+  expect(await textByExtension.text()).toContain("ghostd-rest-probe");
+
+  const htmlByAccept = await page.request.get("/api/terminals/0", {
+    headers: { Accept: "text/html" },
+  });
+  expect(htmlByAccept.ok()).toBe(true);
+  expect(htmlByAccept.headers()["content-type"]).toContain("text/html");
+  expect(await htmlByAccept.text()).toContain("ghostd-rest-probe");
+
+  const textBeatsAcceptWithExtension = await page.request.get("/api/terminals/0.txt", {
+    headers: { Accept: "text/html" },
+  });
+  expect(textBeatsAcceptWithExtension.headers()["content-type"]).toContain(
+    "text/plain",
+  );
+});
+
+test("terminal title updates tab heading and REST metadata", async ({ page }) => {
+  await setupTracedPage(page);
+
+  await page.locator("#terminal").click();
+  await page.keyboard.type("printf '\\033]0;ghostd-title-probe\\007'");
+  await page.keyboard.press("Enter");
+
+  await expect(page.locator('[data-terminal-tab="0"]')).toContainText(
+    "ghostd-title-probe",
+  );
+
+  const list = await page.request.get("/api/terminals");
+  expect(list.ok()).toBe(true);
+  const json = await list.json();
+  expect(json.terminals).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: 0, title: "ghostd-title-probe" }),
+    ]),
+  );
+});
+
+test("terminal pwd updates tab heading and REST metadata", async ({ page }) => {
+  await setupTracedPage(page);
+
+  await page.locator("#terminal").click();
+  await page.keyboard.type(
+    "printf '\\033]0;ghostd-pwd-title\\007\\033]7;file://localhost/tmp/ghostd-pwd-probe\\007'; sleep 1",
+  );
+  await page.keyboard.press("Enter");
+
+  const tab = page.locator('[data-terminal-tab="0"]');
+  await expect(tab).toContainText("ghostd-pwd-title");
+  await expect(tab).toContainText("/tmp/ghostd-pwd-probe");
+
+  const list = await page.request.get("/api/terminals");
+  expect(list.ok()).toBe(true);
+  const json = await list.json();
+  expect(json.terminals).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        id: 0,
+        title: "ghostd-pwd-title",
+        pwd: "/tmp/ghostd-pwd-probe",
+      }),
+    ]),
+  );
 });
 
 test("stealing writer keeps terminal visible and does not cause delayed resize churn", async ({

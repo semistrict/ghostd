@@ -6,7 +6,7 @@ pub const Asset = struct {
 };
 
 pub const assets = [_]Asset{
-    .{ .path = "/assets/index-CguZafAj.js", .content_type = "text/javascript; charset=utf-8", .body = @embedFile("embedded_asset_files/assets/index-CguZafAj.js") }, // 49874 bytes,
+    .{ .path = "/assets/index-Bkpilekl.js", .content_type = "text/javascript; charset=utf-8", .body = @embedFile("embedded_asset_files/assets/index-Bkpilekl.js") }, // 49971 bytes,
     .{ .path = "/assets/index-CpuV251Q.css", .content_type = "text/css; charset=utf-8", .body = @embedFile("embedded_asset_files/assets/index-CpuV251Q.css") }, // 3064 bytes,
     .{ .path = "/index.html", .content_type = "text/html; charset=utf-8", .body = @embedFile("embedded_asset_files/index.html") }, // 2215 bytes,
     .{ .path = "/", .content_type = "text/html; charset=utf-8", .body = @embedFile("embedded_asset_files/index.html") }, // 2215 bytes
