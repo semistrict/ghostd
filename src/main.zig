@@ -1,5 +1,6 @@
 const std = @import("std");
 const vt = @import("ghostty-vt");
+const embedded_assets = @import("embedded_assets.zig");
 
 const c = @cImport({
     @cInclude("arpa/inet.h");
@@ -572,15 +573,6 @@ fn sendHttp(fd: c_int, status: []const u8, body: []const u8) !void {
     try writeAllFd(fd, body);
 }
 
-fn contentType(path: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
-    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
-    return "application/octet-stream";
-}
-
 fn requestPath(request: []const u8) []const u8 {
     const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
     const first_line = request[0..first_line_end];
@@ -591,29 +583,24 @@ fn requestPath(request: []const u8) []const u8 {
     return raw[0..query];
 }
 
-fn sendStatic(alloc: std.mem.Allocator, fd: c_int, request: []const u8) !void {
+fn sendStatic(fd: c_int, request: []const u8) !void {
     const path = requestPath(request);
     if (std.mem.indexOf(u8, path, "..") != null) {
         try sendHttp(fd, "400 Bad Request", "bad path\n");
         return;
     }
 
-    const rel = if (std.mem.eql(u8, path, "/"))
-        "dist/index.html"
-    else
-        try std.fmt.allocPrint(alloc, "dist{s}", .{path});
-    defer if (!std.mem.eql(u8, path, "/")) alloc.free(rel);
-
-    const body = std.fs.cwd().readFileAlloc(alloc, rel, 16 * 1024 * 1024) catch {
-        try sendHttp(fd, "404 Not Found", "ghostd native client assets are missing; run `pnpm --filter ghostd build`\n");
+    const asset = for (embedded_assets.assets) |asset| {
+        if (std.mem.eql(u8, asset.path, path)) break asset;
+    } else {
+        try sendHttp(fd, "404 Not Found", "not found\n");
         return;
     };
-    defer alloc.free(body);
 
     var header: [512]u8 = undefined;
-    const text = try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ contentType(rel), body.len });
+    const text = try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ asset.content_type, asset.body.len });
     try writeAllFd(fd, text);
-    try writeAllFd(fd, body);
+    try writeAllFd(fd, asset.body);
 }
 
 fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, clients: *std.array_list.Managed(Client), terminal: *vt.Terminal, render: *vt.RenderState) !void {
@@ -632,7 +619,7 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, clients: *std.array_
     if (n <= 0) return;
     const request = request_buf[0..@intCast(n)];
     const key = findHeader(request, "Sec-WebSocket-Key") orelse {
-        try sendStatic(alloc, fd, request);
+        try sendStatic(fd, request);
         return;
     };
 

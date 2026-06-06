@@ -1,5 +1,4 @@
 packages:
-  - "apps/ghostd"
   - "packages/@wterm/core"
   - "packages/@wterm/dom"
   - "packages/@internal/ts"

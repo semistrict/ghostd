@@ -1,7 +1,7 @@
 .{
-    .name = .ghostd_native,
-    .version = "0.0.0",
-    .fingerprint = 0xd1c1c5c527313c84,
+    .name = .ghostd,
+    .version = "0.1.0",
+    .fingerprint = 0x390f8a22f1e9325e,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .ghostty = .{
