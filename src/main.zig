@@ -973,6 +973,11 @@ fn requestWantsWriter(request: []const u8) bool {
     return false;
 }
 
+fn autoClaimWriterEnabled() bool {
+    const value = std.posix.getenv("GHOSTD_AUTO_CLAIM_WRITER") orelse return false;
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+}
+
 fn acceptsHtml(request: []const u8) bool {
     const accept = findHeader(request, "Accept") orelse return false;
     if (std.mem.indexOf(u8, accept, "text/html") == null) return false;
@@ -1182,7 +1187,7 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, terminals: *std.arra
     const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
     try writeAllFd(fd, response);
 
-    const role: Role = if (session.clients.items.len == 0 or requestWantsWriter(request)) .writer else .reader;
+    const role: Role = if (session.clients.items.len == 0 or requestWantsWriter(request) or autoClaimWriterEnabled()) .writer else .reader;
     if (role == .writer) {
         for (session.clients.items) |*client| client.role = .reader;
     }

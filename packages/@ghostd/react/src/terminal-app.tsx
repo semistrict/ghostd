@@ -310,7 +310,12 @@ export function GhostdTerminalApp({
       terminalElement.classList.toggle("is-reader", nextRole === "reader");
       terminalElement.classList.toggle("is-writer", nextRole === "writer");
       if (autoClaimWriter && nextRole === "reader") {
-        core.claimWriter();
+        window.setTimeout(() => {
+          if (!disposed && core.getRole() === "reader") core.claimWriter();
+        }, 0);
+        window.setTimeout(() => {
+          if (!disposed && core.getRole() === "reader") core.claimWriter();
+        }, 250);
       }
       if (nextRole === "writer") {
         terminal.focus();
