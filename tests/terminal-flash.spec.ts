@@ -211,12 +211,27 @@ function watchConsole(
 }
 
 function decodedType(entry: TraceEntry): unknown {
+  if (Array.isArray(entry.decoded)) {
+    switch (entry.decoded[0]) {
+      case 1:
+        return "input";
+      case 2:
+        return "resize";
+      case 3:
+        return "claimWriter";
+      case 4:
+        return "scroll";
+      default:
+        return null;
+    }
+  }
   if (typeof entry.decoded !== "object" || entry.decoded === null) return null;
   if (!("type" in entry.decoded)) return null;
   return entry.decoded.type;
 }
 
 function decodedData(entry: TraceEntry): unknown {
+  if (Array.isArray(entry.decoded)) return entry.decoded[2];
   if (typeof entry.decoded !== "object" || entry.decoded === null) return null;
   if (!("data" in entry.decoded)) return null;
   return entry.decoded.data;

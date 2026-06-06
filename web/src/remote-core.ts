@@ -10,6 +10,11 @@ import type {
   ClientRole,
   PackedRow,
   ServerMessage,
+  TerminalId,
+} from "./protocol.js";
+import {
+  decodeServerMessage,
+  encodeClientMessage,
 } from "./protocol.js";
 
 const DEFAULT_COLOR = 256;
@@ -22,6 +27,7 @@ const BLANK_CELL: CellData = {
 };
 
 export class RemoteTerminalCore implements TerminalCore {
+  private terminalId: TerminalId = 0;
   private cols = 80;
   private rows = 24;
   private viewport: CellData[][] = [];
@@ -36,6 +42,10 @@ export class RemoteTerminalCore implements TerminalCore {
 
   onUpdate: (() => void) | null = null;
   onRoleChange: ((role: ClientRole) => void) | null = null;
+
+  constructor(terminalId: TerminalId = 0) {
+    this.terminalId = terminalId;
+  }
 
   init(cols: number, rows: number): void {
     this.cols = cols;
@@ -53,7 +63,7 @@ export class RemoteTerminalCore implements TerminalCore {
     this.rows = rows;
     this.viewport = this.resizeViewport(cols, rows);
     for (let row = 0; row < rows; row++) this.dirtyRows.add(row);
-    this.send({ type: "resize", cols, rows });
+    this.send({ type: "resize", terminalId: this.terminalId, cols, rows });
   }
 
   connect(url: string): void {
@@ -67,7 +77,7 @@ export class RemoteTerminalCore implements TerminalCore {
         event.data instanceof ArrayBuffer
           ? new Uint8Array(event.data)
           : new Uint8Array(event.data as ArrayBufferLike);
-      this.applyMessage(decode(bytes) as ServerMessage);
+      this.applyMessage(decodeServerMessage(decode(bytes)));
       this.onUpdate?.();
     };
 
@@ -93,7 +103,7 @@ export class RemoteTerminalCore implements TerminalCore {
 
   claimWriter(): void {
     if (this.role === "writer") return;
-    this.send({ type: "claimWriter" });
+    this.send({ type: "claimWriter", terminalId: this.terminalId });
   }
 
   wantsMouseInput(): boolean {
@@ -102,7 +112,7 @@ export class RemoteTerminalCore implements TerminalCore {
 
   scrollViewport(rows: number, direction: "up" | "down"): void {
     if (this.role !== "writer") return;
-    this.send({ type: "scroll", rows, direction });
+    this.send({ type: "scroll", terminalId: this.terminalId, rows, direction });
   }
 
   forceResize(): void {
@@ -172,6 +182,7 @@ export class RemoteTerminalCore implements TerminalCore {
   private applyMessage(message: ServerMessage): void {
     if (message.type === "snapshot") {
       const resized = message.cols !== this.cols || message.rows !== this.rows;
+      this.terminalId = message.terminalId;
       this.cols = message.cols;
       this.rows = message.rows;
       this.setRole(message.role);
@@ -248,11 +259,11 @@ export class RemoteTerminalCore implements TerminalCore {
   private sendInput(data: string): void {
     if (this.role !== "writer") return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.send({ type: "input", data });
+    this.send({ type: "input", terminalId: this.terminalId, data });
   }
 
   private send(message: ClientMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(encode(message));
+    this.ws.send(encode(encodeClientMessage(message)));
   }
 }

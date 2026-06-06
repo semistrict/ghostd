@@ -24,6 +24,37 @@ const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: usize = 64;
 const SNAPSHOT_COALESCE_MS: i64 = 16;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const DEFAULT_TERMINAL_ID: u32 = 0;
+
+const ClientOpcode = enum(u8) {
+    input = 1,
+    resize = 2,
+    claim_writer = 3,
+    scroll = 4,
+    list_terminals = 5,
+    create_terminal = 6,
+    close_terminal = 7,
+};
+
+const ServerOpcode = enum(u8) {
+    snapshot = 1,
+    rows = 2,
+    role = 3,
+    exit = 4,
+    terminals = 5,
+    terminal_created = 6,
+    terminal_closed = 7,
+};
+
+const WireRole = enum(u8) {
+    reader = 0,
+    writer = 1,
+};
+
+const ScrollDirection = enum(u8) {
+    up = 0,
+    down = 1,
+};
 
 const Cell = struct {
     char: u32,
@@ -48,19 +79,19 @@ const Role = enum {
     writer,
     reader,
 
-    fn label(self: Role) []const u8 {
+    fn wire(self: Role) WireRole {
         return switch (self) {
-            .writer => "writer",
-            .reader => "reader",
+            .writer => .writer,
+            .reader => .reader,
         };
     }
 };
 
 const ClientMessage = union(enum) {
-    input: []const u8,
-    resize: struct { cols: u16, rows: u16 },
-    scroll: struct { rows: u16, direction: []const u8 },
-    claim_writer,
+    input: struct { terminal_id: u32, data: []const u8 },
+    resize: struct { terminal_id: u32, cols: u16, rows: u16 },
+    scroll: struct { terminal_id: u32, rows: u16, direction: ScrollDirection },
+    claim_writer: struct { terminal_id: u32 },
     unknown,
 };
 
@@ -218,6 +249,10 @@ const MsgpackWriter = struct {
         try self.byte(if (value) 0xc3 else 0xc2);
     }
 
+    fn nilValue(self: *MsgpackWriter) !void {
+        try self.byte(0xc0);
+    }
+
     fn uint(self: *MsgpackWriter, value: u32) !void {
         if (value <= 0x7f) {
             try self.byte(@intCast(value));
@@ -247,25 +282,23 @@ const MsgpackWriter = struct {
 };
 
 fn encodeCell(writer: *MsgpackWriter, cell: Cell) !void {
-    var entries: u16 = 4;
-    if (cell.fg_rgb != null) entries += 1;
-    if (cell.bg_rgb != null) entries += 1;
-    try writer.map(entries);
-    try writer.str("char");
+    const has_rgb = cell.fg_rgb != null or cell.bg_rgb != null;
+    try writer.array(if (has_rgb) 6 else 4);
     try writer.uint(if (cell.char == 0) 32 else cell.char);
-    try writer.str("fg");
     try writer.uint(cell.fg);
-    try writer.str("bg");
     try writer.uint(cell.bg);
-    try writer.str("flags");
     try writer.uint(cell.flags);
-    if (cell.fg_rgb) |rgb| {
-        try writer.str("fgRgb");
-        try writer.uint(rgb);
-    }
-    if (cell.bg_rgb) |rgb| {
-        try writer.str("bgRgb");
-        try writer.uint(rgb);
+    if (has_rgb) {
+        if (cell.fg_rgb) |rgb| {
+            try writer.uint(rgb);
+        } else {
+            try writer.nilValue();
+        }
+        if (cell.bg_rgb) |rgb| {
+            try writer.uint(rgb);
+        } else {
+            try writer.nilValue();
+        }
     }
 }
 
@@ -273,38 +306,23 @@ fn encodeSnapshot(alloc: std.mem.Allocator, snap: Snapshot, role: Role) ![]u8 {
     var writer = MsgpackWriter.init(alloc);
     errdefer writer.deinit();
 
-    try writer.map(10);
-    try writer.str("type");
-    try writer.str("snapshot");
-    try writer.str("sessionId");
-    try writer.str("default");
-    try writer.str("role");
-    try writer.str(role.label());
-    try writer.str("cols");
+    try writer.array(10);
+    try writer.uint(@intFromEnum(ServerOpcode.snapshot));
+    try writer.uint(DEFAULT_TERMINAL_ID);
     try writer.uint(snap.cols);
-    try writer.str("rows");
     try writer.uint(snap.rows);
-    try writer.str("cursor");
-    try writer.map(3);
-    try writer.str("row");
+    try writer.uint(@intFromEnum(role.wire()));
+    try writer.array(3);
     try writer.uint(snap.cursor_row);
-    try writer.str("col");
     try writer.uint(snap.cursor_col);
-    try writer.str("visible");
     try writer.boolValue(snap.cursor_visible);
-    try writer.str("mouseReporting");
     try writer.boolValue(snap.mouse_reporting);
-    try writer.str("scrollback");
     try writer.array(0);
-    try writer.str("scrollbackLineLens");
     try writer.array(0);
-    try writer.str("viewport");
     try writer.array(snap.rows);
     for (0..snap.rows) |row| {
-        try writer.map(2);
-        try writer.str("index");
+        try writer.array(2);
         try writer.uint(@intCast(row));
-        try writer.str("cells");
         try writer.array(snap.cols);
         const start = row * @as(usize, snap.cols);
         for (snap.cells[start .. start + snap.cols]) |cell| {
@@ -318,11 +336,10 @@ fn encodeSnapshot(alloc: std.mem.Allocator, snap: Snapshot, role: Role) ![]u8 {
 fn encodeRole(alloc: std.mem.Allocator, role: Role) ![]u8 {
     var writer = MsgpackWriter.init(alloc);
     errdefer writer.deinit();
-    try writer.map(2);
-    try writer.str("type");
-    try writer.str("role");
-    try writer.str("role");
-    try writer.str(role.label());
+    try writer.array(3);
+    try writer.uint(@intFromEnum(ServerOpcode.role));
+    try writer.uint(DEFAULT_TERMINAL_ID);
+    try writer.uint(@intFromEnum(role.wire()));
     return writer.buf.toOwnedSlice();
 }
 
@@ -418,41 +435,42 @@ const MsgpackReader = struct {
 fn decodeClientMessage(data: []const u8) !ClientMessage {
     var reader = MsgpackReader{ .data = data };
     const marker = try reader.readByte();
-    const pairs = try reader.readLen(marker);
-    var kind: ?[]const u8 = null;
-    var input: ?[]const u8 = null;
-    var direction: ?[]const u8 = null;
-    var cols: ?u16 = null;
-    var rows: ?u16 = null;
+    const len = try reader.readLen(marker);
+    if (len == 0) return .unknown;
 
-    for (0..pairs) |_| {
-        const key = try reader.readString();
-        if (std.mem.eql(u8, key, "type")) {
-            kind = try reader.readString();
-        } else if (std.mem.eql(u8, key, "data")) {
-            input = try reader.readString();
-        } else if (std.mem.eql(u8, key, "direction")) {
-            direction = try reader.readString();
-        } else if (std.mem.eql(u8, key, "cols")) {
-            cols = @intCast(try reader.readUint());
-        } else if (std.mem.eql(u8, key, "rows")) {
-            rows = @intCast(try reader.readUint());
-        } else {
-            try reader.skip();
-        }
+    const opcode_raw = try reader.readUint();
+    const opcode = std.meta.intToEnum(ClientOpcode, @as(u8, @intCast(opcode_raw))) catch return .unknown;
+    switch (opcode) {
+        .input => {
+            if (len != 3) return .unknown;
+            const terminal_id = try reader.readUint();
+            const input = try reader.readString();
+            return .{ .input = .{ .terminal_id = terminal_id, .data = input } };
+        },
+        .resize => {
+            if (len != 4) return .unknown;
+            const terminal_id = try reader.readUint();
+            const cols: u16 = @intCast(try reader.readUint());
+            const rows: u16 = @intCast(try reader.readUint());
+            return .{ .resize = .{ .terminal_id = terminal_id, .cols = cols, .rows = rows } };
+        },
+        .claim_writer => {
+            if (len != 2) return .unknown;
+            return .{ .claim_writer = .{ .terminal_id = try reader.readUint() } };
+        },
+        .scroll => {
+            if (len != 4) return .unknown;
+            const terminal_id = try reader.readUint();
+            const rows: u16 = @intCast(try reader.readUint());
+            const direction_raw: u8 = @intCast(try reader.readUint());
+            const direction = std.meta.intToEnum(ScrollDirection, direction_raw) catch return .unknown;
+            return .{ .scroll = .{ .terminal_id = terminal_id, .rows = rows, .direction = direction } };
+        },
+        .list_terminals,
+        .create_terminal,
+        .close_terminal,
+        => return .unknown,
     }
-
-    if (kind) |value| {
-        if (std.mem.eql(u8, value, "input")) return .{ .input = input orelse "" };
-        if (std.mem.eql(u8, value, "resize") and cols != null and rows != null) {
-            return .{ .resize = .{ .cols = cols.?, .rows = rows.? } };
-        }
-        if (std.mem.eql(u8, value, "scroll") and rows != null and direction != null) {
-            return .{ .scroll = .{ .rows = rows.?, .direction = direction.? } };
-        }
-        if (std.mem.eql(u8, value, "claimWriter")) return .claim_writer;
-    }
-    return .unknown;
 }
 
 fn parsePort(args: []const []const u8) u16 {
@@ -865,8 +883,8 @@ pub fn main() !void {
                     claimWriter(&clients, idx);
                     broadcastRoles(alloc, &clients);
                 },
-                .input => |data| {
-                    if (clients.items[idx].role == .writer) try writeAllFd(pty_fd, data);
+                .input => |input| {
+                    if (clients.items[idx].role == .writer) try writeAllFd(pty_fd, input.data);
                 },
                 .resize => |size| {
                     if (clients.items[idx].role == .writer) {
@@ -880,10 +898,10 @@ pub fn main() !void {
                         !terminal.modes.get(.mouse_event_button) and
                         !terminal.modes.get(.mouse_event_any))
                     {
-                        const delta: isize = if (std.mem.eql(u8, scroll.direction, "up"))
-                            -@as(isize, @intCast(scroll.rows))
-                        else
-                            @as(isize, @intCast(scroll.rows));
+                        const delta: isize = switch (scroll.direction) {
+                            .up => -@as(isize, @intCast(scroll.rows)),
+                            .down => @as(isize, @intCast(scroll.rows)),
+                        };
                         terminal.screens.active.scroll(.{ .delta_row = delta });
                         try broadcastSnapshot(alloc, &clients, &terminal, &render);
                     }
@@ -939,22 +957,25 @@ test "color-only cells preserve background colors" {
     try std.testing.expectEqual(@as(?u24, null), snap.cells[0].fg_rgb);
 }
 
-test "decodes client input and resize messages" {
-    const input = [_]u8{ 0x82, 0xa4, 't', 'y', 'p', 'e', 0xa5, 'i', 'n', 'p', 'u', 't', 0xa4, 'd', 'a', 't', 'a', 0xa1, 'x' };
+test "decodes compact client protocol messages" {
+    const input = [_]u8{ 0x93, 0x01, 0x2a, 0xa1, 'x' };
     const msg = try decodeClientMessage(&input);
-    try std.testing.expectEqualStrings("x", msg.input);
+    try std.testing.expectEqual(@as(u32, 42), msg.input.terminal_id);
+    try std.testing.expectEqualStrings("x", msg.input.data);
 
-    const resize = [_]u8{ 0x83, 0xa4, 't', 'y', 'p', 'e', 0xa6, 'r', 'e', 's', 'i', 'z', 'e', 0xa4, 'c', 'o', 'l', 's', 0xcc, 120, 0xa4, 'r', 'o', 'w', 's', 0x28 };
+    const resize = [_]u8{ 0x94, 0x02, 0x2a, 0xcc, 120, 0x28 };
     const resize_msg = try decodeClientMessage(&resize);
+    try std.testing.expectEqual(@as(u32, 42), resize_msg.resize.terminal_id);
     try std.testing.expectEqual(@as(u16, 120), resize_msg.resize.cols);
     try std.testing.expectEqual(@as(u16, 40), resize_msg.resize.rows);
 
-    const claim = [_]u8{ 0x81, 0xa4, 't', 'y', 'p', 'e', 0xab, 'c', 'l', 'a', 'i', 'm', 'W', 'r', 'i', 't', 'e', 'r' };
+    const claim = [_]u8{ 0x92, 0x03, 0x2a };
     const claim_msg = try decodeClientMessage(&claim);
-    try std.testing.expect(claim_msg == .claim_writer);
+    try std.testing.expectEqual(@as(u32, 42), claim_msg.claim_writer.terminal_id);
 
-    const scroll = [_]u8{ 0x83, 0xa4, 't', 'y', 'p', 'e', 0xa6, 's', 'c', 'r', 'o', 'l', 'l', 0xa4, 'r', 'o', 'w', 's', 0x03, 0xa9, 'd', 'i', 'r', 'e', 'c', 't', 'i', 'o', 'n', 0xa2, 'u', 'p' };
+    const scroll = [_]u8{ 0x94, 0x04, 0x2a, 0x03, 0x00 };
     const scroll_msg = try decodeClientMessage(&scroll);
+    try std.testing.expectEqual(@as(u32, 42), scroll_msg.scroll.terminal_id);
     try std.testing.expectEqual(@as(u16, 3), scroll_msg.scroll.rows);
-    try std.testing.expectEqualStrings("up", scroll_msg.scroll.direction);
+    try std.testing.expectEqual(ScrollDirection.up, scroll_msg.scroll.direction);
 }
