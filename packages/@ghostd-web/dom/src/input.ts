@@ -1,4 +1,4 @@
-import type { TerminalCore } from "@wterm/core";
+import type { TerminalCore } from "@ghostd-web/core";
 
 const NORMAL_KEYS: Record<string, string> = {
   ArrowUp: "\x1b[A",

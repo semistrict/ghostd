@@ -1,5 +1,5 @@
-import { WTerm } from "@wterm/dom";
-import "@wterm/dom/css";
+import { GhostdWebTerminal } from "@ghostd-web/dom";
+import "@ghostd-web/dom/css";
 import { RemoteTerminalCore } from "./remote-core.js";
 import type { ClientRole } from "./protocol.js";
 
@@ -8,7 +8,7 @@ const status = document.getElementById("status")!;
 const claimWriterButton =
   document.querySelector<HTMLButtonElement>("#claim-writer")!;
 const core = new RemoteTerminalCore();
-const term = new WTerm(container, {
+const term = new GhostdWebTerminal(container, {
   core,
   cols: 80,
   rows: 24,

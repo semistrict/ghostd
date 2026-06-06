@@ -10,23 +10,22 @@
   },
   "scripts": {
     "dev": "pnpm native:dev",
-    "client:dev": "sh scripts/portless.sh ghostd.wterm vite --config web/vite.config.ts",
-    "native:dev": "pnpm build && sh scripts/portless.sh ghostd.wterm pnpm native:run",
+    "client:dev": "sh scripts/portless.sh ghostd-web vite --config web/vite.config.ts",
+    "native:dev": "pnpm build && sh scripts/portless.sh ghostd-web pnpm native:run",
     "native:build": "pnpm build:web && sh scripts/zig-015.sh build --cache-dir .zig-cache --global-cache-dir .zig-cache",
     "native:run": "pnpm build:web && sh scripts/zig-015.sh build run --cache-dir .zig-cache --global-cache-dir .zig-cache",
     "native:test": "pnpm build:web && sh scripts/zig-015.sh build test --cache-dir .zig-cache --global-cache-dir .zig-cache",
-    "build:deps": "pnpm --filter @wterm/core build && pnpm --filter @wterm/dom build",
     "build:web": "vite build --config web/vite.config.ts && node scripts/generate-embedded-assets.mjs",
-    "build": "pnpm build:deps && pnpm build:web",
-    "type-check": "pnpm --filter @wterm/core type-check && pnpm --filter @wterm/dom type-check && tsc --project web/tsconfig.json --noEmit",
-    "test": "pnpm --filter @wterm/core build && pnpm --filter @wterm/dom test && pnpm native:test && pnpm e2e",
+    "build": "pnpm build:web",
+    "type-check": "pnpm --filter @ghostd-web/core type-check && pnpm --filter @ghostd-web/dom type-check && tsc --project web/tsconfig.json --noEmit",
+    "test": "pnpm --filter @ghostd-web/dom test && pnpm native:test && pnpm e2e",
     "e2e": "playwright test",
     "preview": "vite preview --config web/vite.config.ts"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
-    "@wterm/core": "workspace:^",
-    "@wterm/dom": "workspace:^"
+    "@ghostd-web/core": "workspace:^",
+    "@ghostd-web/dom": "workspace:^"
   },
   "devDependencies": {
     "@internal/ts": "workspace:*",

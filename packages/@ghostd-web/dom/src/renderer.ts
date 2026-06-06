@@ -1,4 +1,4 @@
-import type { TerminalCore } from "@wterm/core";
+import type { TerminalCore } from "@ghostd-web/core";
 
 const DEFAULT_COLOR = 256;
 const FLAG_BOLD = 0x01;

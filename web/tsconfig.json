@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["node", "vite/client"]
   },
-  "include": ["src", "vite.config.ts", "wterm-dom.d.ts"]
+  "include": ["src", "vite.config.ts", "ghostd-web-dom.d.ts"]
 }

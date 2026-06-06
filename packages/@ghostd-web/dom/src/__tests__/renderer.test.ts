@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Renderer } from "../renderer.js";
-import type { CellData, CursorState } from "@wterm/core";
+import type { CellData, CursorState } from "@ghostd-web/core";
 
 function createMockBridge(cols: number, rows: number, grid: CellData[][] = []) {
   const dirtyRows = new Set<number>();

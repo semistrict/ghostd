@@ -3,7 +3,7 @@ import type {
   CursorState,
   TerminalCore,
   UnhandledSequence,
-} from "@wterm/core";
+} from "@ghostd-web/core";
 import { decode, encode } from "@msgpack/msgpack";
 import type {
   ClientMessage,

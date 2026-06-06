@@ -1,4 +1,4 @@
-import type { TerminalCore, CellData } from "@wterm/core";
+import type { TerminalCore, CellData } from "@ghostd-web/core";
 
 const FLAG_NAMES: Record<number, string> = {
   0x01: "bold",
@@ -290,7 +290,7 @@ export class DebugAdapter {
   dump(count = 50): void {
     const entries = this._traces.slice(-count);
     console.group(
-      `%cwterm debug — last ${entries.length} traces`,
+      `%cghostd-web debug — last ${entries.length} traces`,
       "color: #569cd6; font-weight: bold",
     );
     for (const e of entries) {
@@ -330,11 +330,11 @@ export class DebugAdapter {
   dumpUnhandled(): void {
     const entries = this.unhandled();
     if (entries.length === 0) {
-      console.log("%cwterm debug — no unhandled sequences", "color: #6a9955");
+      console.log("%cghostd-web debug — no unhandled sequences", "color: #6a9955");
       return;
     }
     console.group(
-      `%cwterm debug — ${entries.length} unhandled sequences`,
+      `%cghostd-web debug — ${entries.length} unhandled sequences`,
       "color: #d7ba7d; font-weight: bold",
     );
     for (const e of entries) {

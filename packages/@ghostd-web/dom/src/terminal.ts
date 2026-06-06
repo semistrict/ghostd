@@ -1,17 +1,12 @@
-import { WasmBridge, type TerminalCore } from "@wterm/core";
+import type { TerminalCore } from "@ghostd-web/core";
 import { Renderer } from "./renderer.js";
 import { InputHandler } from "./input.js";
 import { DebugAdapter } from "./debug.js";
 
-export interface WTermOptions {
+export interface GhostdWebTerminalOptions {
   cols?: number;
   rows?: number;
-  /**
-   * A pre-constructed terminal core. When provided, `wasmUrl` is ignored and
-   * this core is used directly instead of loading the built-in Zig WASM binary.
-   */
-  core?: TerminalCore;
-  wasmUrl?: string;
+  core: TerminalCore;
   autoResize?: boolean;
   cursorBlink?: boolean;
   debug?: boolean;
@@ -20,7 +15,7 @@ export interface WTermOptions {
   onResize?: (cols: number, rows: number) => void;
 }
 
-export class WTerm {
+export class GhostdWebTerminal {
   element: HTMLElement;
   cols: number;
   rows: number;
@@ -28,8 +23,7 @@ export class WTerm {
   autoResize: boolean;
   debug: DebugAdapter | null = null;
 
-  private _coreOption: TerminalCore | undefined;
-  private wasmUrl: string | undefined;
+  private _coreOption: TerminalCore;
   private _debugEnabled: boolean;
   private renderer: Renderer | null = null;
   private input: InputHandler | null = null;
@@ -47,10 +41,9 @@ export class WTerm {
 
   private _container: HTMLDivElement;
 
-  constructor(element: HTMLElement, options: WTermOptions = {}) {
+  constructor(element: HTMLElement, options: GhostdWebTerminalOptions) {
     this.element = element;
     this._coreOption = options.core;
-    this.wasmUrl = options.wasmUrl;
     this.cols = options.cols || 80;
     this.rows = options.rows || 24;
     this.autoResize = options.autoResize !== false;
@@ -63,7 +56,7 @@ export class WTerm {
     this._container = document.createElement("div");
     this._container.className = "term-grid";
     this.element.appendChild(this._container);
-    this.element.classList.add("wterm");
+    this.element.classList.add("ghostd-web");
     if (options.cursorBlink) this.element.classList.add("cursor-blink");
 
     this._onClickFocus = () => {
@@ -75,18 +68,14 @@ export class WTerm {
 
   async init(): Promise<this> {
     try {
-      if (this._coreOption) {
-        this.bridge = this._coreOption;
-      } else {
-        this.bridge = await WasmBridge.load(this.wasmUrl);
-      }
+      this.bridge = this._coreOption;
       if (this._destroyed) return this;
       this.bridge.init(this.cols, this.rows);
 
       if (this._debugEnabled) {
         this.debug = new DebugAdapter();
         this.debug.setBridge(this.bridge);
-        (globalThis as Record<string, unknown>).__wterm = this;
+        (globalThis as Record<string, unknown>).__ghostdWeb = this;
       }
 
       this._setRowHeight();
@@ -118,7 +107,7 @@ export class WTerm {
     } catch (err) {
       this.destroy();
       throw new Error(
-        `wterm: failed to initialize: ${err instanceof Error ? err.message : err}`,
+        `ghostd-web: failed to initialize: ${err instanceof Error ? err.message : err}`,
       );
     }
 
@@ -314,9 +303,9 @@ export class WTerm {
     this.element.innerHTML = "";
     if (
       this.debug &&
-      (globalThis as Record<string, unknown>).__wterm === this
+      (globalThis as Record<string, unknown>).__ghostdWeb === this
     ) {
-      delete (globalThis as Record<string, unknown>).__wterm;
+      delete (globalThis as Record<string, unknown>).__ghostdWeb;
     }
     this.debug = null;
   }

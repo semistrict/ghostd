@@ -1,5 +1,5 @@
-export { WTerm } from "./wterm.js";
-export type { WTermOptions } from "./wterm.js";
+export { GhostdWebTerminal } from "./terminal.js";
+export type { GhostdWebTerminalOptions } from "./terminal.js";
 export { Renderer } from "./renderer.js";
 export { InputHandler } from "./input.js";
 export { DebugAdapter } from "./debug.js";
@@ -10,4 +10,4 @@ export type {
   PerfStats,
   UnhandledEntry,
 } from "./debug.js";
-export * from "@wterm/core";
+export * from "@ghostd-web/core";

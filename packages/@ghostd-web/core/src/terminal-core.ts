@@ -22,10 +22,7 @@ export interface UnhandledSequence {
   params: number[];
 }
 
-/**
- * Abstract terminal emulation core. The built-in Zig WASM core (`WasmBridge`)
- * implements this interface so that `@wterm/dom` can render it.
- */
+/** Abstract terminal emulation core used by the DOM renderer. */
 export interface TerminalCore {
   // -- Lifecycle --
   init(cols: number, rows: number): void;

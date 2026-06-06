@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { InputHandler } from "../input.js";
-import type { WasmBridge } from "@wterm/core";
+import type { TerminalCore } from "@ghostd-web/core";
 
 function createKeyboardEvent(
   key: string,
@@ -18,7 +18,7 @@ describe("InputHandler", () => {
   let container: HTMLElement;
   let received: string[];
   let handler: InputHandler;
-  let bridgeMock: WasmBridge | null;
+  let bridgeMock: TerminalCore | null;
 
   beforeEach(() => {
     container = document.createElement("div");

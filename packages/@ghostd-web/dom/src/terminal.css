@@ -1,4 +1,4 @@
-.wterm {
+.ghostd-web {
   --term-fg: #d4d4d4;
   --term-bg: #1e1e1e;
   --term-cursor: #aeafad;
@@ -38,8 +38,8 @@
   overflow: hidden;
 }
 
-.wterm:focus,
-.wterm:focus-visible {
+.ghostd-web:focus,
+.ghostd-web:focus-visible {
   outline: none;
 }
 
@@ -73,13 +73,13 @@
   outline-offset: -1px;
 }
 
-.wterm.focused .term-cursor {
+.ghostd-web.focused .term-cursor {
   background: var(--term-cursor);
   color: var(--term-bg);
   outline: none;
 }
 
-.wterm.focused.cursor-blink .term-cursor {
+.ghostd-web.focused.cursor-blink .term-cursor {
   animation: cursor-blink 1s step-end infinite;
 }
 
@@ -88,16 +88,16 @@
   50% { background: transparent; color: inherit; }
 }
 
-.wterm.has-scrollback {
+.ghostd-web.has-scrollback {
   overflow-y: auto;
 }
 
-.wterm ::selection {
+.ghostd-web ::selection {
   background: rgba(86, 156, 214, 0.3);
 }
 
 /* Solarized Dark */
-.wterm.theme-solarized-dark {
+.ghostd-web.theme-solarized-dark {
   --term-fg: #839496;
   --term-bg: #002b36;
   --term-cursor: #93a1a1;
@@ -120,7 +120,7 @@
 }
 
 /* Monokai */
-.wterm.theme-monokai {
+.ghostd-web.theme-monokai {
   --term-fg: #f8f8f2;
   --term-bg: #272822;
   --term-cursor: #f8f8f0;
@@ -143,7 +143,7 @@
 }
 
 /* Light */
-.wterm.theme-light {
+.ghostd-web.theme-light {
   --term-fg: #383a42;
   --term-bg: #fafafa;
   --term-cursor: #526eff;

@@ -1,4 +1,4 @@
-import type { CellData, CursorState } from "@wterm/core";
+import type { CellData, CursorState } from "@ghostd-web/core";
 
 export type TerminalId = number;
 export type ClientRole = "writer" | "reader";

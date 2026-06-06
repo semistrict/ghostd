@@ -7,6 +7,6 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    allowedHosts: ["ghostd.wterm.localhost"],
+    allowedHosts: ["ghostd-web.localhost"],
   },
 });

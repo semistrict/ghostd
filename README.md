@@ -6,7 +6,7 @@ readers or claim the single writer role.
 
 This repository is laid out as a Zig project with a TypeScript browser client
 in `web/`. The browser assets are built and embedded into the native binary, so
-the daemon can serve the client itself. The remaining `@wterm/*` packages are
+the daemon can serve the client itself. The remaining `@ghostd-web/*` packages are
 local support packages used by the browser client; they are not separate
 applications.
 
@@ -29,8 +29,8 @@ Current scope: one terminal session per daemon process.
 - `web/` - browser client source and Vite build.
 - `tests/` - Playwright e2e tests.
 - `scripts/` - build helpers, asset embedding, and portless wrapper.
-- `packages/@wterm/dom` - local DOM renderer/input package.
-- `packages/@wterm/core` - local renderer core types and terminal helpers.
+- `packages/@ghostd-web/dom` - local DOM renderer/input package.
+- `packages/@ghostd-web/core` - local shared renderer/core TypeScript types.
 - `packages/@internal/ts` - shared TypeScript config.
 
 ## Requirements
@@ -54,7 +54,7 @@ pnpm dev
 Portless serves the app at:
 
 ```text
-https://ghostd.wterm.localhost
+https://ghostd-web.localhost
 ```
 
 ## Scripts

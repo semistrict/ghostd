@@ -1,6 +1,6 @@
 packages:
-  - "packages/@wterm/core"
-  - "packages/@wterm/dom"
+  - "packages/@ghostd-web/core"
+  - "packages/@ghostd-web/dom"
   - "packages/@internal/ts"
 
 minimumReleaseAge: 2880
