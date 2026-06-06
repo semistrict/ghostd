@@ -1,5 +1,7 @@
 packages:
+  - "packages/@ghostd/react"
   - "packages/@ghostd-web/core"
+  - "packages/@ghostd-web/client"
   - "packages/@ghostd-web/dom"
   - "packages/@internal/ts"
 

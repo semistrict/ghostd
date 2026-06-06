@@ -17,80 +17,16 @@
         overflow: hidden;
       }
 
-      #terminal {
+      #root {
         width: 100vw;
-        height: calc(100dvh - 32px);
-        border-radius: 0;
-        box-shadow: none;
-      }
-
-      #status-bar {
-        height: 32px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 0 12px;
-        color: #c9d1d9;
-        background: #1b1f26;
-        border-bottom: 1px solid #2d333b;
-        font:
-          12px/1.2 ui-monospace,
-          SFMono-Regular,
-          Menlo,
-          Consolas,
-          monospace;
-      }
-
-      #tabs {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-      }
-
-      .terminal-tab,
-      #new-terminal,
-      #claim-writer {
-        height: 22px;
-        padding: 0 9px;
-        border: 1px solid #46515f;
-        border-radius: 4px;
-        color: #dbe7f3;
-        background: #26313d;
-        font: inherit;
-        cursor: pointer;
-      }
-
-      .terminal-tab[aria-selected="true"] {
-        border-color: #6aa6ff;
-        background: #1f3b5f;
-      }
-
-      .terminal-tab:hover,
-      #new-terminal:hover,
-      #claim-writer:hover {
-        background: #314052;
-      }
-
-      .terminal-tab:active,
-      #new-terminal:active,
-      #claim-writer:active {
-        background: #1f2934;
-      }
-
-      #claim-writer[hidden] {
-        display: none;
+        height: 100dvh;
+        min-height: 0;
       }
     </style>
-    <script type="module" crossorigin src="/assets/index-Bkpilekl.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CpuV251Q.css">
+    <script type="module" crossorigin src="./assets/index-DqpI-767.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-CtAOGc52.css">
   </head>
   <body>
-    <div id="status-bar">
-      <div id="tabs" role="tablist" aria-label="terminals"></div>
-      <button id="new-terminal" type="button" aria-label="new terminal">+</button>
-      <span>role: <span id="status">reader</span></span>
-      <button id="claim-writer" type="button">steal write</button>
-    </div>
-    <div id="terminal"></div>
+    <div id="root"></div>
   </body>
 </html>

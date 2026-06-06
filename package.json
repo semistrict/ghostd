@@ -17,20 +17,27 @@
     "native:test": "pnpm build:web && sh scripts/zig-015.sh build test --cache-dir .zig-cache --global-cache-dir .zig-cache",
     "build:web": "vite build --config web/vite.config.ts && node scripts/generate-embedded-assets.mjs",
     "build": "pnpm build:web",
-    "type-check": "pnpm --filter @ghostd-web/core type-check && pnpm --filter @ghostd-web/dom type-check && tsc --project web/tsconfig.json --noEmit",
+    "type-check": "pnpm --filter @ghostd-web/core type-check && pnpm --filter @ghostd-web/client type-check && pnpm --filter @ghostd-web/dom type-check && pnpm --filter @ghostd/react type-check && tsc --project web/tsconfig.json --noEmit",
     "test": "pnpm --filter @ghostd-web/dom test && pnpm native:test && pnpm e2e",
     "e2e": "playwright test",
     "preview": "vite preview --config web/vite.config.ts"
   },
   "dependencies": {
-    "@msgpack/msgpack": "^3.1.3",
+    "@ghostd/react": "workspace:^",
+    "@ghostd-web/client": "workspace:^",
     "@ghostd-web/core": "workspace:^",
-    "@ghostd-web/dom": "workspace:^"
+    "@ghostd-web/dom": "workspace:^",
+    "@msgpack/msgpack": "^3.1.3",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
     "@internal/ts": "workspace:*",
     "@playwright/test": "^1.60.0",
     "@types/node": "^25.9.1",
+    "@types/react": "^19.2.16",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
     "typescript": "^6.0.3",
     "vite": "^8.0.16"
   },

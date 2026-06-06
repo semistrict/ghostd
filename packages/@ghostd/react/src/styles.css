@@ -1,0 +1,112 @@
+@import "@ghostd-web/dom/css";
+
+.ghostd-react-shell {
+  display: grid;
+  grid-template-rows: 32px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: #101216;
+  color: #c9d1d9;
+}
+
+.ghostd-react-status-bar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid #2d333b;
+  background: #1b1f26;
+  padding: 0 12px;
+  font:
+    12px/1.2 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    monospace;
+}
+
+.ghostd-react-tabs {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.ghostd-react-tab,
+.ghostd-react-button {
+  height: 22px;
+  border: 1px solid #46515f;
+  border-radius: 4px;
+  background: #26313d;
+  color: #dbe7f3;
+  cursor: pointer;
+  font: inherit;
+}
+
+.ghostd-react-tab {
+  max-width: 220px;
+  overflow: hidden;
+  padding: 0 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ghostd-react-button {
+  flex: 0 0 auto;
+  padding: 0 9px;
+}
+
+.ghostd-react-tab[aria-selected="true"] {
+  border-color: #6aa6ff;
+  background: #1f3b5f;
+}
+
+.ghostd-react-tab:hover,
+.ghostd-react-button:hover {
+  background: #314052;
+}
+
+.ghostd-react-tab:active,
+.ghostd-react-button:active {
+  background: #1f2934;
+}
+
+.ghostd-react-button[hidden] {
+  display: none;
+}
+
+.ghostd-react-spacer {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ghostd-react-role,
+.ghostd-react-connection {
+  flex: 0 0 auto;
+  color: #9da7b3;
+  white-space: nowrap;
+}
+
+.ghostd-react-role-value,
+.ghostd-react-connection-value {
+  color: #dbe7f3;
+}
+
+.ghostd-react-connection-value[data-state="open"] {
+  color: #7ee787;
+}
+
+.ghostd-react-connection-value[data-state="closed"],
+.ghostd-react-connection-value[data-state="error"] {
+  color: #ff7b72;
+}
+
+.ghostd-react-terminal {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 0;
+  box-shadow: none;
+}

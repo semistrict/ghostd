@@ -111,10 +111,11 @@ function installFrontendTrace(): void {
     };
   }
 
-  window.addEventListener("DOMContentLoaded", () => {
-    push({ type: "dom:content-loaded" });
+  let terminalObserverInstalled = false;
+  function observeTerminal(): boolean {
     const terminal = document.querySelector("#terminal");
-    if (!terminal) return;
+    if (!terminal || terminalObserverInstalled) return Boolean(terminal);
+    terminalObserverInstalled = true;
     const observer = new MutationObserver((records) => {
       push({
         type: "dom:mutation",
@@ -129,6 +130,20 @@ function installFrontendTrace(): void {
     observer.observe(terminal, {
       childList: true,
       characterData: true,
+      subtree: true,
+    });
+    return true;
+  }
+
+  window.addEventListener("DOMContentLoaded", () => {
+    push({ type: "dom:content-loaded" });
+    if (observeTerminal()) return;
+
+    const rootObserver = new MutationObserver(() => {
+      if (observeTerminal()) rootObserver.disconnect();
+    });
+    rootObserver.observe(document.documentElement, {
+      childList: true,
       subtree: true,
     });
   });

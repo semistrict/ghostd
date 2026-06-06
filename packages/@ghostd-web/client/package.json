@@ -1,0 +1,40 @@
+{
+  "name": "@ghostd-web/client",
+  "version": "0.3.0",
+  "description": "TypeScript client for the ghostd websocket protocol",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.3"
+  },
+  "devDependencies": {
+    "@internal/ts": "workspace:*",
+    "typescript": "^6.0.2"
+  },
+  "keywords": [
+    "terminal",
+    "websocket",
+    "ghostd"
+  ],
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/semistrict/ghostd",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/semistrict/ghostd",
+    "directory": "packages/@ghostd-web/client"
+  }
+}
