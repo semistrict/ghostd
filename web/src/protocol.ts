@@ -23,7 +23,7 @@ export type WireServerMessage =
       number[],
       WirePackedRow[],
     ]
-  | [ServerOpcode.Rows, TerminalId, WireCursor, WirePackedRow[]]
+  | [ServerOpcode.Rows, TerminalId, WireCursor, WireCellRange[]]
   | [ServerOpcode.Role, TerminalId, WireRole]
   | [ServerOpcode.Exit, TerminalId, number]
   | [ServerOpcode.Terminals, WireTerminalSummary[]]
@@ -65,6 +65,7 @@ type WireCell =
   | [number, number, number, number]
   | [number, number, number, number, number | null, number | null];
 type WirePackedRow = [number, WireCell[]];
+type WireCellRange = [number, number, WireCell[]];
 type WireTerminalSummary = [
   TerminalId,
   string | null,
@@ -77,6 +78,12 @@ type WireTerminalSummary = [
 
 export interface PackedRow {
   index: number;
+  cells: CellData[];
+}
+
+export interface CellRange {
+  row: number;
+  col: number;
   cells: CellData[];
 }
 
@@ -124,7 +131,7 @@ export interface SnapshotMessage extends TerminalMessage {
 export interface RowsMessage extends TerminalMessage {
   type: "rows";
   cursor: CursorState;
-  rows: PackedRow[];
+  ranges: CellRange[];
 }
 
 export interface ExitMessage extends TerminalMessage {
@@ -231,7 +238,7 @@ export function decodeServerMessage(message: unknown): ServerMessage {
         type: "rows",
         terminalId: numberAt(message, 1),
         cursor: decodeCursor(message[2]),
-        rows: decodeRows(message[3]),
+        ranges: decodeCellRanges(message[3]),
       };
     case ServerOpcode.Role:
       return {
@@ -300,6 +307,17 @@ function decodeRows(value: unknown): PackedRow[] {
     return {
       index: numberAt(packed, 0),
       cells: decodeCells(packed[1]),
+    };
+  });
+}
+
+function decodeCellRanges(value: unknown): CellRange[] {
+  return arrayValue(value).map((range) => {
+    const packed = arrayValue(range);
+    return {
+      row: numberAt(packed, 0),
+      col: numberAt(packed, 1),
+      cells: decodeCells(packed[2]),
     };
   });
 }

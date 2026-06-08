@@ -251,6 +251,32 @@ function decodedType(entry: TraceEntry): unknown {
   return entry.decoded.type;
 }
 
+function decodedServerType(entry: TraceEntry): unknown {
+  if (Array.isArray(entry.decoded)) {
+    switch (entry.decoded[0]) {
+      case 1:
+        return "snapshot";
+      case 2:
+        return "rows";
+      case 3:
+        return "role";
+      case 4:
+        return "exit";
+      case 5:
+        return "terminals";
+      case 6:
+        return "terminalCreated";
+      case 7:
+        return "terminalClosed";
+      default:
+        return null;
+    }
+  }
+  if (typeof entry.decoded !== "object" || entry.decoded === null) return null;
+  if (!("type" in entry.decoded)) return null;
+  return entry.decoded.type;
+}
+
 async function terminalText(page: import("@playwright/test").Page): Promise<string> {
   return page.locator("#terminal").textContent();
 }
@@ -303,6 +329,21 @@ test("typing trace records frontend activity and all websocket messages", async 
     (entry) => decodedType(entry) === "input" && decodedData(entry) === "e",
   )?.at;
   const resizeAfterTyping = resizeSendsAtOrAfter(trace, firstTypedInputAt);
+  const rangeMessagesAfterTyping = trace.filter(
+    (entry) =>
+      firstTypedInputAt !== undefined &&
+      entry.at >= firstTypedInputAt &&
+      entry.type === "ws:message" &&
+      decodedServerType(entry) === "rows",
+  );
+  const rangeLengths = rangeMessagesAfterTyping.flatMap((entry) => {
+    if (!Array.isArray(entry.decoded)) return [];
+    const ranges = entry.decoded[3];
+    if (!Array.isArray(ranges)) return [];
+    return ranges
+      .filter((range): range is unknown[] => Array.isArray(range))
+      .map((range) => (Array.isArray(range[2]) ? range[2].length : 0));
+  });
 
   expect(messages.length, "server websocket messages").toBeGreaterThan(0);
   expect(sends.length, "client websocket messages").toBeGreaterThan(0);
@@ -311,6 +352,11 @@ test("typing trace records frontend activity and all websocket messages", async 
     true,
   );
   expect(resizeAfterTyping, "typing must not trigger resize churn").toHaveLength(0);
+  expect(rangeLengths.length, "typing should receive cell-range updates").toBeGreaterThan(0);
+  expect(
+    Math.max(...rangeLengths),
+    "typing should not receive full-row updates",
+  ).toBeLessThan(80);
 });
 
 test("writer terminal fills the available viewport height", async ({ page }) => {

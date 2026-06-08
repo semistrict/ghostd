@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const StreamAction = vt.StreamAction;
 const embedded_assets = @import("embedded_assets.zig");
+const protocol = @import("protocol.zig");
+const snapshot_mod = @import("snapshot.zig");
 
 const c = @cImport({
     @cInclude("arpa/inet.h");
@@ -24,69 +26,66 @@ const c = @cImport({
     }
 });
 
-const DEFAULT_COLOR: u16 = 256;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: usize = 64;
 const MAX_TERMINALS: usize = 16;
 const MAX_TITLE_BYTES: usize = 256;
 const MAX_PWD_BYTES: usize = 512;
-const SNAPSHOT_COALESCE_MS: i64 = 16;
+const SNAPSHOT_COALESCE_MS: i64 = 4;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_TERMINAL_ID: u32 = 0;
+const PROTOCOL_BINLOG_MAGIC = "GHOSTD-PROTOCOL-BINLOG\x00\x01";
 
-const ClientOpcode = enum(u8) {
-    input = 1,
-    resize = 2,
-    claim_writer = 3,
-    scroll = 4,
-    list_terminals = 5,
-    create_terminal = 6,
-    close_terminal = 7,
-};
-
-const ServerOpcode = enum(u8) {
-    snapshot = 1,
-    rows = 2,
-    role = 3,
-    exit = 4,
-    terminals = 5,
-    terminal_created = 6,
-    terminal_closed = 7,
-};
-
-const WireRole = enum(u8) {
-    reader = 0,
-    writer = 1,
-};
-
-const ScrollDirection = enum(u8) {
-    up = 0,
-    down = 1,
-};
+const ServerOpcode = protocol.ServerOpcode;
+const WireRole = protocol.WireRole;
+const ScrollDirection = protocol.ScrollDirection;
+const MsgpackWriter = protocol.MsgpackWriter;
+const Cell = protocol.Cell;
+const Snapshot = protocol.Snapshot;
+const CellRange = protocol.CellRange;
+const ClientMessage = protocol.ClientMessage;
+const buildChangedRanges = protocol.buildChangedRanges;
+const decodeClientMessage = protocol.decodeClientMessage;
+const encodeRows = protocol.encodeRows;
+const snapshot = snapshot_mod.capture;
 
 const TerminalContentFormat = enum {
     html,
     text,
 };
 
-const Cell = struct {
-    char: u32,
-    fg: u16 = DEFAULT_COLOR,
-    bg: u16 = DEFAULT_COLOR,
-    flags: u8 = 0,
-    fg_rgb: ?u24 = null,
-    bg_rgb: ?u24 = null,
+const ProtocolDirection = enum(u8) {
+    in = 0,
+    out = 1,
 };
 
-const Snapshot = struct {
-    cols: u16,
-    rows: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-    cursor_visible: bool,
-    mouse_reporting: bool,
-    cells: []Cell,
+const ProtocolBinlog = struct {
+    file: ?std.fs.File = null,
+
+    fn open(path: ?[]const u8) !ProtocolBinlog {
+        const file_path = path orelse return .{};
+        var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
+        errdefer file.close();
+        try file.writeAll(PROTOCOL_BINLOG_MAGIC);
+        return .{ .file = file };
+    }
+
+    fn close(self: *ProtocolBinlog) void {
+        if (self.file) |file| file.close();
+        self.file = null;
+    }
+
+    fn write(self: *ProtocolBinlog, direction: ProtocolDirection, fd: c_int, payload: []const u8) !void {
+        const file = self.file orelse return;
+        var header: [17]u8 = undefined;
+        header[0] = @intFromEnum(direction);
+        std.mem.writeInt(u32, header[1..5], @bitCast(fd), .little);
+        std.mem.writeInt(u64, header[5..13], @intCast(std.time.nanoTimestamp()), .little);
+        std.mem.writeInt(u32, header[13..17], @intCast(payload.len), .little);
+        try file.writeAll(&header);
+        try file.writeAll(payload);
+    }
 };
 
 const Role = enum {
@@ -99,17 +98,6 @@ const Role = enum {
             .reader => .reader,
         };
     }
-};
-
-const ClientMessage = union(enum) {
-    input: struct { terminal_id: u32, data: []const u8 },
-    resize: struct { terminal_id: u32, cols: u16, rows: u16 },
-    scroll: struct { terminal_id: u32, rows: u16, direction: ScrollDirection },
-    claim_writer: struct { terminal_id: u32 },
-    list_terminals,
-    create_terminal: struct { cols: u16, rows: u16 },
-    close_terminal: struct { terminal_id: u32 },
-    unknown,
 };
 
 const Client = struct {
@@ -158,6 +146,9 @@ const TerminalSession = struct {
     pending_resize: ?struct { cols: u16, rows: u16 } = null,
     pending_snapshot: bool = false,
     last_pty_output_ms: i64 = 0,
+    last_snapshot_cells: []Cell = &.{},
+    last_snapshot_cols: u16 = 0,
+    last_snapshot_rows: u16 = 0,
 
     fn create(alloc: std.mem.Allocator, id: u32, cols: u16, rows: u16) !*TerminalSession {
         const session = try alloc.create(TerminalSession);
@@ -181,6 +172,9 @@ const TerminalSession = struct {
         session.pending_resize = null;
         session.pending_snapshot = false;
         session.last_pty_output_ms = 0;
+        session.last_snapshot_cells = &.{};
+        session.last_snapshot_cols = 0;
+        session.last_snapshot_rows = 0;
         session.pty_fd = try spawnPty(cols, rows);
         return session;
     }
@@ -191,6 +185,7 @@ const TerminalSession = struct {
         self.stream.deinit();
         self.render.deinit(alloc);
         self.terminal.deinit(alloc);
+        if (self.last_snapshot_cells.len > 0) alloc.free(self.last_snapshot_cells);
         if (self.pty_fd >= 0) _ = c.close(self.pty_fd);
         alloc.destroy(self);
     }
@@ -223,239 +218,6 @@ const TerminalSession = struct {
         return true;
     }
 };
-
-fn packRgb(rgb: vt.color.RGB) u24 {
-    return (@as(u24, rgb.r) << 16) | (@as(u24, rgb.g) << 8) | @as(u24, rgb.b);
-}
-
-fn packFlags(style: vt.Style) u8 {
-    var flags: u8 = 0;
-    if (style.flags.bold) flags |= 0x01;
-    if (style.flags.faint) flags |= 0x02;
-    if (style.flags.italic) flags |= 0x04;
-    if (style.flags.underline != .none) flags |= 0x08;
-    if (style.flags.blink) flags |= 0x10;
-    if (style.flags.inverse) flags |= 0x20;
-    if (style.flags.invisible) flags |= 0x40;
-    if (style.flags.strikethrough) flags |= 0x80;
-    return flags;
-}
-
-fn resolveRgb(color: vt.Style.Color, palette: *const vt.color.Palette) ?u24 {
-    return switch (color) {
-        .none => null,
-        .palette => |idx| packRgb(palette[idx]),
-        .rgb => |rgb| packRgb(rgb),
-    };
-}
-
-fn cellBackgroundRgb(raw: vt.Cell, palette: *const vt.color.Palette) ?u24 {
-    return switch (raw.content_tag) {
-        .bg_color_palette => packRgb(palette[raw.content.color_palette]),
-        .bg_color_rgb => packRgb(.{
-            .r = raw.content.color_rgb.r,
-            .g = raw.content.color_rgb.g,
-            .b = raw.content.color_rgb.b,
-        }),
-        else => null,
-    };
-}
-
-fn contentCodepoint(raw: vt.Cell) u32 {
-    return switch (raw.content_tag) {
-        .codepoint, .codepoint_grapheme => raw.content.codepoint,
-        else => 0,
-    };
-}
-
-fn snapshot(alloc: std.mem.Allocator, terminal: *vt.Terminal, render: *vt.RenderState) !Snapshot {
-    try render.update(alloc, terminal);
-
-    const cols = render.cols;
-    const rows = render.rows;
-    const palette = &render.colors.palette;
-    const cells = try alloc.alloc(Cell, @as(usize, cols) * @as(usize, rows));
-    errdefer alloc.free(cells);
-
-    const row_cells = render.row_data.items(.cells);
-    for (0..rows) |y| {
-        const row = if (y < row_cells.len) row_cells[y] else null;
-        for (0..cols) |x| {
-            const out = &cells[@as(usize, y) * @as(usize, cols) + @as(usize, x)];
-            out.* = .{ .char = 32 };
-            const cell_list = row orelse continue;
-            const raw_cells = cell_list.items(.raw);
-            if (x >= raw_cells.len) continue;
-
-            const raw = raw_cells[x];
-            const has_style = raw.style_id > 0;
-            const style: vt.Style = if (has_style) cell_list.items(.style)[x] else .{};
-            const bg_rgb = cellBackgroundRgb(raw, palette) orelse
-                if (has_style) resolveRgb(style.bg_color, palette) else null;
-            out.* = .{
-                .char = contentCodepoint(raw),
-                .flags = packFlags(style),
-                .fg_rgb = if (has_style) resolveRgb(style.fg_color, palette) else null,
-                .bg_rgb = bg_rgb,
-            };
-        }
-    }
-
-    const cursor = render.cursor.viewport;
-    return .{
-        .cols = cols,
-        .rows = rows,
-        .cursor_row = if (cursor) |cur| cur.y else 0,
-        .cursor_col = if (cursor) |cur| cur.x else 0,
-        .cursor_visible = render.cursor.visible and cursor != null,
-        .mouse_reporting = terminal.modes.get(.mouse_event_x10) or
-            terminal.modes.get(.mouse_event_normal) or
-            terminal.modes.get(.mouse_event_button) or
-            terminal.modes.get(.mouse_event_any),
-        .cells = cells,
-    };
-}
-
-const MsgpackWriter = struct {
-    buf: std.array_list.Managed(u8),
-
-    fn init(alloc: std.mem.Allocator) MsgpackWriter {
-        return .{ .buf = std.array_list.Managed(u8).init(alloc) };
-    }
-
-    fn deinit(self: *MsgpackWriter) void {
-        self.buf.deinit();
-    }
-
-    fn bytes(self: *const MsgpackWriter) []const u8 {
-        return self.buf.items;
-    }
-
-    fn byte(self: *MsgpackWriter, value: u8) !void {
-        try self.buf.append(value);
-    }
-
-    fn str(self: *MsgpackWriter, value: []const u8) !void {
-        if (value.len <= 31) {
-            try self.byte(0xa0 | @as(u8, @intCast(value.len)));
-        } else if (value.len <= 0xff) {
-            try self.byte(0xd9);
-            try self.byte(@intCast(value.len));
-        } else {
-            try self.byte(0xda);
-            try self.u16be(@intCast(value.len));
-        }
-        try self.buf.appendSlice(value);
-    }
-
-    fn map(self: *MsgpackWriter, len: u16) !void {
-        if (len <= 15) {
-            try self.byte(0x80 | @as(u8, @intCast(len)));
-        } else {
-            try self.byte(0xde);
-            try self.u16be(len);
-        }
-    }
-
-    fn array(self: *MsgpackWriter, len: u32) !void {
-        if (len <= 15) {
-            try self.byte(0x90 | @as(u8, @intCast(len)));
-        } else if (len <= 0xffff) {
-            try self.byte(0xdc);
-            try self.u16be(@intCast(len));
-        } else {
-            try self.byte(0xdd);
-            try self.u32be(len);
-        }
-    }
-
-    fn boolValue(self: *MsgpackWriter, value: bool) !void {
-        try self.byte(if (value) 0xc3 else 0xc2);
-    }
-
-    fn nilValue(self: *MsgpackWriter) !void {
-        try self.byte(0xc0);
-    }
-
-    fn uint(self: *MsgpackWriter, value: u32) !void {
-        if (value <= 0x7f) {
-            try self.byte(@intCast(value));
-        } else if (value <= 0xff) {
-            try self.byte(0xcc);
-            try self.byte(@intCast(value));
-        } else if (value <= 0xffff) {
-            try self.byte(0xcd);
-            try self.u16be(@intCast(value));
-        } else {
-            try self.byte(0xce);
-            try self.u32be(value);
-        }
-    }
-
-    fn u16be(self: *MsgpackWriter, value: u16) !void {
-        try self.byte(@intCast(value >> 8));
-        try self.byte(@intCast(value & 0xff));
-    }
-
-    fn u32be(self: *MsgpackWriter, value: u32) !void {
-        try self.byte(@intCast((value >> 24) & 0xff));
-        try self.byte(@intCast((value >> 16) & 0xff));
-        try self.byte(@intCast((value >> 8) & 0xff));
-        try self.byte(@intCast(value & 0xff));
-    }
-};
-
-fn encodeCell(writer: *MsgpackWriter, cell: Cell) !void {
-    const has_rgb = cell.fg_rgb != null or cell.bg_rgb != null;
-    try writer.array(if (has_rgb) 6 else 4);
-    try writer.uint(if (cell.char == 0) 32 else cell.char);
-    try writer.uint(cell.fg);
-    try writer.uint(cell.bg);
-    try writer.uint(cell.flags);
-    if (has_rgb) {
-        if (cell.fg_rgb) |rgb| {
-            try writer.uint(rgb);
-        } else {
-            try writer.nilValue();
-        }
-        if (cell.bg_rgb) |rgb| {
-            try writer.uint(rgb);
-        } else {
-            try writer.nilValue();
-        }
-    }
-}
-
-fn encodeSnapshot(alloc: std.mem.Allocator, terminal_id: u32, snap: Snapshot, role: Role) ![]u8 {
-    var writer = MsgpackWriter.init(alloc);
-    errdefer writer.deinit();
-
-    try writer.array(10);
-    try writer.uint(@intFromEnum(ServerOpcode.snapshot));
-    try writer.uint(terminal_id);
-    try writer.uint(snap.cols);
-    try writer.uint(snap.rows);
-    try writer.uint(@intFromEnum(role.wire()));
-    try writer.array(3);
-    try writer.uint(snap.cursor_row);
-    try writer.uint(snap.cursor_col);
-    try writer.boolValue(snap.cursor_visible);
-    try writer.boolValue(snap.mouse_reporting);
-    try writer.array(0);
-    try writer.array(0);
-    try writer.array(snap.rows);
-    for (0..snap.rows) |row| {
-        try writer.array(2);
-        try writer.uint(@intCast(row));
-        try writer.array(snap.cols);
-        const start = row * @as(usize, snap.cols);
-        for (snap.cells[start .. start + snap.cols]) |cell| {
-            try encodeCell(&writer, cell);
-        }
-    }
-
-    return writer.buf.toOwnedSlice();
-}
 
 fn encodeRole(alloc: std.mem.Allocator, terminal_id: u32, role: Role) ![]u8 {
     var writer = MsgpackWriter.init(alloc);
@@ -525,31 +287,6 @@ fn encodeTerminalCreated(alloc: std.mem.Allocator, session: *TerminalSession) ![
     return writer.buf.toOwnedSlice();
 }
 
-fn appendCodepoint(buf: *std.array_list.Managed(u8), codepoint: u32) !void {
-    const scalar = if (codepoint == 0) 32 else codepoint;
-    if (scalar > 0x10ffff) {
-        try buf.appendSlice("\xef\xbf\xbd");
-        return;
-    }
-    var encoded: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(@as(u21, @intCast(scalar)), &encoded) catch {
-        try buf.appendSlice("\xef\xbf\xbd");
-        return;
-    };
-    try buf.appendSlice(encoded[0..len]);
-}
-
-fn appendHtmlEscapedCodepoint(buf: *std.array_list.Managed(u8), codepoint: u32) !void {
-    switch (if (codepoint == 0) 32 else codepoint) {
-        '&' => try buf.appendSlice("&amp;"),
-        '<' => try buf.appendSlice("&lt;"),
-        '>' => try buf.appendSlice("&gt;"),
-        '"' => try buf.appendSlice("&quot;"),
-        '\'' => try buf.appendSlice("&#39;"),
-        else => |cp| try appendCodepoint(buf, cp),
-    }
-}
-
 fn appendJsonString(buf: *std.array_list.Managed(u8), value: []const u8) !void {
     try buf.append('"');
     for (value) |byte| {
@@ -564,223 +301,6 @@ fn appendJsonString(buf: *std.array_list.Managed(u8), value: []const u8) !void {
         }
     }
     try buf.append('"');
-}
-
-fn appendHexColor(buf: *std.array_list.Managed(u8), rgb: u24) !void {
-    try buf.writer().print("#{x:0>6}", .{rgb});
-}
-
-fn appendCellStyle(buf: *std.array_list.Managed(u8), cell: Cell) !bool {
-    const has_style = cell.fg_rgb != null or cell.bg_rgb != null or cell.flags != 0;
-    if (!has_style) return false;
-
-    try buf.appendSlice("<span style=\"");
-    if (cell.fg_rgb) |rgb| {
-        try buf.appendSlice("color:");
-        try appendHexColor(buf, rgb);
-        try buf.appendSlice(";");
-    }
-    if (cell.bg_rgb) |rgb| {
-        try buf.appendSlice("background-color:");
-        try appendHexColor(buf, rgb);
-        try buf.appendSlice(";");
-    }
-    if ((cell.flags & 0x01) != 0) try buf.appendSlice("font-weight:700;");
-    if ((cell.flags & 0x02) != 0) try buf.appendSlice("opacity:.7;");
-    if ((cell.flags & 0x04) != 0) try buf.appendSlice("font-style:italic;");
-    if ((cell.flags & 0x08) != 0) try buf.appendSlice("text-decoration:underline;");
-    if ((cell.flags & 0x80) != 0) try buf.appendSlice("text-decoration:line-through;");
-    try buf.appendSlice("\">");
-    return true;
-}
-
-fn snapshotText(alloc: std.mem.Allocator, snap: Snapshot) ![]u8 {
-    var out = std.array_list.Managed(u8).init(alloc);
-    errdefer out.deinit();
-
-    for (0..snap.rows) |row| {
-        const start = row * @as(usize, snap.cols);
-        var end = start + snap.cols;
-        while (end > start) {
-            const cell = snap.cells[end - 1];
-            const char = if (cell.char == 0) 32 else cell.char;
-            if (char != 32) break;
-            end -= 1;
-        }
-        for (snap.cells[start..end]) |cell| try appendCodepoint(&out, cell.char);
-        if (row + 1 < snap.rows) try out.append('\n');
-    }
-
-    return out.toOwnedSlice();
-}
-
-fn snapshotHtml(alloc: std.mem.Allocator, terminal_id: u32, snap: Snapshot) ![]u8 {
-    var out = std.array_list.Managed(u8).init(alloc);
-    errdefer out.deinit();
-
-    try out.writer().print(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>ghostd terminal {d}</title><style>body{{margin:0;background:#1e1e1e;color:#d4d4d4}}pre{{margin:0;padding:12px;font:14px/17px Menlo,Consolas,monospace;white-space:pre}}</style></head><body><pre>",
-        .{terminal_id},
-    );
-    for (0..snap.rows) |row| {
-        const start = row * @as(usize, snap.cols);
-        var end = start + snap.cols;
-        while (end > start) {
-            const cell = snap.cells[end - 1];
-            const char = if (cell.char == 0) 32 else cell.char;
-            if (char != 32 or cell.bg_rgb != null) break;
-            end -= 1;
-        }
-        for (snap.cells[start..end]) |cell| {
-            const styled = try appendCellStyle(&out, cell);
-            try appendHtmlEscapedCodepoint(&out, cell.char);
-            if (styled) try out.appendSlice("</span>");
-        }
-        if (row + 1 < snap.rows) try out.append('\n');
-    }
-    try out.appendSlice("</pre></body></html>");
-
-    return out.toOwnedSlice();
-}
-
-const MsgpackReader = struct {
-    data: []const u8,
-    pos: usize = 0,
-
-    fn readByte(self: *MsgpackReader) !u8 {
-        if (self.pos >= self.data.len) return error.EndOfStream;
-        const value = self.data[self.pos];
-        self.pos += 1;
-        return value;
-    }
-
-    fn readLen(self: *MsgpackReader, marker: u8) !usize {
-        return switch (marker) {
-            0x80...0x8f => marker & 0x0f,
-            0xde => try self.readU16(),
-            0xdf => try self.readU32(),
-            0x90...0x9f => marker & 0x0f,
-            0xdc => try self.readU16(),
-            0xdd => try self.readU32(),
-            0xa0...0xbf => marker & 0x1f,
-            0xd9 => try self.readByte(),
-            0xda => try self.readU16(),
-            0xdb => try self.readU32(),
-            else => error.UnsupportedMsgpack,
-        };
-    }
-
-    fn readU16(self: *MsgpackReader) !u16 {
-        const a = try self.readByte();
-        const b = try self.readByte();
-        return (@as(u16, a) << 8) | b;
-    }
-
-    fn readU32(self: *MsgpackReader) !u32 {
-        const a = try self.readByte();
-        const b = try self.readByte();
-        const d = try self.readByte();
-        const e = try self.readByte();
-        return (@as(u32, a) << 24) | (@as(u32, b) << 16) | (@as(u32, d) << 8) | e;
-    }
-
-    fn readString(self: *MsgpackReader) ![]const u8 {
-        const marker = try self.readByte();
-        const len = try self.readLen(marker);
-        if (self.pos + len > self.data.len) return error.EndOfStream;
-        const value = self.data[self.pos .. self.pos + len];
-        self.pos += len;
-        return value;
-    }
-
-    fn readUint(self: *MsgpackReader) !u32 {
-        const marker = try self.readByte();
-        return switch (marker) {
-            0x00...0x7f => marker,
-            0xcc => try self.readByte(),
-            0xcd => try self.readU16(),
-            0xce => try self.readU32(),
-            else => error.UnsupportedMsgpack,
-        };
-    }
-
-    fn skip(self: *MsgpackReader) !void {
-        const marker = try self.readByte();
-        switch (marker) {
-            0x00...0x7f, 0xc0, 0xc2, 0xc3 => {},
-            0xcc => _ = try self.readByte(),
-            0xcd => _ = try self.readU16(),
-            0xce => _ = try self.readU32(),
-            0xa0...0xbf, 0xd9, 0xda, 0xdb => {
-                const len = try self.readLen(marker);
-                if (self.pos + len > self.data.len) return error.EndOfStream;
-                self.pos += len;
-            },
-            0x80...0x8f, 0xde, 0xdf => {
-                const len = try self.readLen(marker);
-                for (0..len) |_| {
-                    try self.skip();
-                    try self.skip();
-                }
-            },
-            0x90...0x9f, 0xdc, 0xdd => {
-                const len = try self.readLen(marker);
-                for (0..len) |_| try self.skip();
-            },
-            else => return error.UnsupportedMsgpack,
-        }
-    }
-};
-
-fn decodeClientMessage(data: []const u8) !ClientMessage {
-    var reader = MsgpackReader{ .data = data };
-    const marker = try reader.readByte();
-    const len = try reader.readLen(marker);
-    if (len == 0) return .unknown;
-
-    const opcode_raw = try reader.readUint();
-    const opcode = std.meta.intToEnum(ClientOpcode, @as(u8, @intCast(opcode_raw))) catch return .unknown;
-    switch (opcode) {
-        .input => {
-            if (len != 3) return .unknown;
-            const terminal_id = try reader.readUint();
-            const input = try reader.readString();
-            return .{ .input = .{ .terminal_id = terminal_id, .data = input } };
-        },
-        .resize => {
-            if (len != 4) return .unknown;
-            const terminal_id = try reader.readUint();
-            const cols: u16 = @intCast(try reader.readUint());
-            const rows: u16 = @intCast(try reader.readUint());
-            return .{ .resize = .{ .terminal_id = terminal_id, .cols = cols, .rows = rows } };
-        },
-        .claim_writer => {
-            if (len != 2) return .unknown;
-            return .{ .claim_writer = .{ .terminal_id = try reader.readUint() } };
-        },
-        .scroll => {
-            if (len != 4) return .unknown;
-            const terminal_id = try reader.readUint();
-            const rows: u16 = @intCast(try reader.readUint());
-            const direction_raw: u8 = @intCast(try reader.readUint());
-            const direction = std.meta.intToEnum(ScrollDirection, direction_raw) catch return .unknown;
-            return .{ .scroll = .{ .terminal_id = terminal_id, .rows = rows, .direction = direction } };
-        },
-        .list_terminals => {
-            if (len != 1) return .unknown;
-            return .list_terminals;
-        },
-        .create_terminal => {
-            if (len != 3) return .unknown;
-            const cols: u16 = @intCast(try reader.readUint());
-            const rows: u16 = @intCast(try reader.readUint());
-            return .{ .create_terminal = .{ .cols = cols, .rows = rows } };
-        },
-        .close_terminal => {
-            if (len != 2) return .unknown;
-            return .{ .close_terminal = .{ .terminal_id = try reader.readUint() } };
-        },
-    }
 }
 
 fn parsePort(args: []const []const u8) u16 {
@@ -811,6 +331,19 @@ fn parseHost(args: []const []const u8) []const u8 {
     return "127.0.0.1";
 }
 
+fn parseProtocolBinlogPath(args: []const []const u8) ?[]const u8 {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--protocol-binlog") and i + 1 < args.len) {
+            return args[i + 1];
+        }
+        if (std.mem.startsWith(u8, args[i], "--protocol-binlog=")) {
+            return args[i]["--protocol-binlog=".len..];
+        }
+    }
+    return null;
+}
+
 fn wantsHelp(args: []const []const u8) bool {
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
@@ -824,12 +357,13 @@ fn printUsage() !void {
     const stdout = &stdout_writer.interface;
 
     try stdout.writeAll(
-        \\Usage: ghostd [--host HOST] [--port PORT]
+        \\Usage: ghostd [--host HOST] [--port PORT] [--protocol-binlog FILE]
         \\
         \\Options:
-        \\  -h, --help     Show this help message.
-        \\  --host HOST    Listen on HOST (default: 127.0.0.1, or HOST env var).
-        \\  --port PORT    Listen on PORT (default: 7341, or PORT env var).
+        \\  -h, --help             Show this help message.
+        \\  --host HOST            Listen on HOST (default: 127.0.0.1, or HOST env var).
+        \\  --port PORT            Listen on PORT (default: 7341, or PORT env var).
+        \\  --protocol-binlog FILE Write binary websocket protocol payload log to FILE.
         \\
     );
     try stdout.flush();
@@ -1071,8 +605,8 @@ fn sendTerminalContent(alloc: std.mem.Allocator, fd: c_int, request: []const u8,
     defer alloc.free(snap.cells);
 
     const body = switch (format) {
-        .html => try snapshotHtml(alloc, session.id, snap),
-        .text => try snapshotText(alloc, snap),
+        .html => try snapshot_mod.html(alloc, session.id, snap),
+        .text => try snapshot_mod.text(alloc, snap),
     };
     defer alloc.free(body);
 
@@ -1131,19 +665,19 @@ fn findSession(terminals: *std.array_list.Managed(*TerminalSession), terminal_id
     return null;
 }
 
-fn sendTerminals(alloc: std.mem.Allocator, fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
+fn sendTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
     const payload = try encodeTerminals(alloc, terminals);
     defer alloc.free(payload);
-    try sendWebsocket(fd, payload);
+    try sendWebsocket(logger, fd, payload);
 }
 
-fn broadcastTerminals(alloc: std.mem.Allocator, terminals: *std.array_list.Managed(*TerminalSession)) void {
+fn broadcastTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, terminals: *std.array_list.Managed(*TerminalSession)) void {
     const payload = encodeTerminals(alloc, terminals) catch return;
     defer alloc.free(payload);
     for (terminals.items) |session| {
         var i: usize = 0;
         while (i < session.clients.items.len) {
-            sendWebsocket(session.clients.items[i].fd, payload) catch {
+            sendWebsocket(logger, session.clients.items[i].fd, payload) catch {
                 closeClient(session, i);
                 continue;
             };
@@ -1152,7 +686,7 @@ fn broadcastTerminals(alloc: std.mem.Allocator, terminals: *std.array_list.Manag
     }
 }
 
-fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
+fn acceptClient(alloc: std.mem.Allocator, logger: *ProtocolBinlog, listen_fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
     const fd = c.accept(listen_fd, null, null);
     if (fd < 0) return;
     errdefer _ = c.close(fd);
@@ -1196,16 +730,21 @@ fn acceptClient(alloc: std.mem.Allocator, listen_fd: c_int, terminals: *std.arra
 
     const snap = try snapshot(alloc, &session.terminal, &session.render);
     defer alloc.free(snap.cells);
-    const payload = try encodeSnapshot(alloc, session.id, snap, role);
+    const payload = try protocol.encodeSnapshot(alloc, session.id, snap, role.wire());
     defer alloc.free(payload);
-    sendWebsocket(fd, payload) catch {
+    sendWebsocket(logger, fd, payload) catch {
         closeClient(session, client_index);
         return;
     };
-    sendTerminals(alloc, fd, terminals) catch {};
+    if (session.last_snapshot_cells.len == 0) {
+        session.last_snapshot_cells = try alloc.dupe(Cell, snap.cells);
+        session.last_snapshot_cols = snap.cols;
+        session.last_snapshot_rows = snap.rows;
+    }
+    sendTerminals(alloc, logger, fd, terminals) catch {};
 }
 
-fn sendWebsocket(fd: c_int, payload: []const u8) !void {
+fn sendWebsocket(logger: *ProtocolBinlog, fd: c_int, payload: []const u8) !void {
     var header: [10]u8 = undefined;
     header[0] = 0x82;
     var header_len: usize = 0;
@@ -1223,11 +762,12 @@ fn sendWebsocket(fd: c_int, payload: []const u8) !void {
         for (0..8) |i| header[2 + i] = @intCast((len64 >> @intCast((7 - i) * 8)) & 0xff);
         header_len = 10;
     }
+    try logger.write(.out, fd, payload);
     try writeAllFd(fd, header[0..header_len]);
     try writeAllFd(fd, payload);
 }
 
-fn readWebsocketFrame(alloc: std.mem.Allocator, fd: c_int) !?[]u8 {
+fn readWebsocketFrame(alloc: std.mem.Allocator, logger: *ProtocolBinlog, fd: c_int) !?[]u8 {
     var header: [2]u8 = undefined;
     const got = c.read(fd, &header, 2);
     if (got == 0) return error.Closed;
@@ -1265,6 +805,7 @@ fn readWebsocketFrame(alloc: std.mem.Allocator, fd: c_int) !?[]u8 {
             byte.* ^= mask[i % 4];
         }
     }
+    try logger.write(.in, fd, payload);
     return payload;
 }
 
@@ -1275,27 +816,55 @@ fn closeClient(session: *TerminalSession, index: usize) void {
     if (was_writer and session.clients.items.len > 0) session.clients.items[0].role = .writer;
 }
 
-fn broadcastSnapshot(alloc: std.mem.Allocator, session: *TerminalSession) !void {
+fn broadcastSnapshot(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session: *TerminalSession) !void {
     const snap = try snapshot(alloc, &session.terminal, &session.render);
     defer alloc.free(snap.cells);
+
+    const dimensions_changed = session.last_snapshot_cols != snap.cols or
+        session.last_snapshot_rows != snap.rows or
+        session.last_snapshot_cells.len != snap.cells.len;
+    const use_full_snapshot = dimensions_changed or session.last_snapshot_cells.len == 0;
+
+    var changed_ranges = if (use_full_snapshot)
+        std.array_list.Managed(CellRange).init(alloc)
+    else
+        try buildChangedRanges(alloc, session.last_snapshot_cells, snap.cells, snap.cols, snap.rows);
+    defer changed_ranges.deinit();
+
+    if (!use_full_snapshot and changed_ranges.items.len == 0) {
+        return;
+    }
+
     var i: usize = 0;
     while (i < session.clients.items.len) {
-        const payload = try encodeSnapshot(alloc, session.id, snap, session.clients.items[i].role);
+        const payload = if (use_full_snapshot)
+            try protocol.encodeSnapshot(alloc, session.id, snap, session.clients.items[i].role.wire())
+        else
+            try encodeRows(alloc, session.id, snap, changed_ranges.items);
         defer alloc.free(payload);
-        sendWebsocket(session.clients.items[i].fd, payload) catch {
+        sendWebsocket(logger, session.clients.items[i].fd, payload) catch {
             closeClient(session, i);
             continue;
         };
         i += 1;
     }
+
+    if (dimensions_changed) {
+        if (session.last_snapshot_cells.len > 0) alloc.free(session.last_snapshot_cells);
+        session.last_snapshot_cells = try alloc.dupe(Cell, snap.cells);
+    } else {
+        @memcpy(session.last_snapshot_cells, snap.cells);
+    }
+    session.last_snapshot_cols = snap.cols;
+    session.last_snapshot_rows = snap.rows;
 }
 
-fn broadcastRoles(alloc: std.mem.Allocator, session: *TerminalSession) void {
+fn broadcastRoles(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session: *TerminalSession) void {
     var i: usize = 0;
     while (i < session.clients.items.len) {
         const payload = encodeRole(alloc, session.id, session.clients.items[i].role) catch return;
         defer alloc.free(payload);
-        sendWebsocket(session.clients.items[i].fd, payload) catch {
+        sendWebsocket(logger, session.clients.items[i].fd, payload) catch {
             closeClient(session, i);
             continue;
         };
@@ -1322,6 +891,8 @@ pub fn main() !void {
     }
     const port = parsePort(args);
     const host = parseHost(args);
+    var protocol_binlog = try ProtocolBinlog.open(parseProtocolBinlogPath(args));
+    defer protocol_binlog.close();
 
     const listen_fd = try createListenSocket(host, port);
     defer _ = c.close(listen_fd);
@@ -1384,7 +955,7 @@ pub fn main() !void {
         if (ready == 0) {
             for (terminals.items) |session| {
                 if (session.pending_snapshot and std.time.milliTimestamp() - session.last_pty_output_ms >= SNAPSHOT_COALESCE_MS) {
-                    try broadcastSnapshot(alloc, session);
+                    try broadcastSnapshot(alloc, &protocol_binlog, session);
                     session.pending_snapshot = false;
                 }
             }
@@ -1392,7 +963,7 @@ pub fn main() !void {
         }
 
         if ((pollfds[0].revents & c.POLLIN) != 0) {
-            acceptClient(alloc, listen_fd, &terminals) catch {};
+            acceptClient(alloc, &protocol_binlog, listen_fd, &terminals) catch {};
         }
 
         for (polled_sessions[0..session_count], 0..) |session, session_index| {
@@ -1413,7 +984,7 @@ pub fn main() !void {
             }
             if (session.metadata_changed) {
                 session.metadata_changed = false;
-                broadcastTerminals(alloc, &terminals);
+                broadcastTerminals(alloc, &protocol_binlog, &terminals);
             }
             session.pending_snapshot = true;
             session.last_pty_output_ms = std.time.milliTimestamp();
@@ -1435,14 +1006,14 @@ pub fn main() !void {
             if ((revents & (c.POLLHUP | c.POLLERR)) != 0) {
                 const was_writer = session.clients.items[client_index].role == .writer;
                 closeClient(session, client_index);
-                if (was_writer) broadcastRoles(alloc, session);
+                if (was_writer) broadcastRoles(alloc, &protocol_binlog, session);
                 continue;
             }
             const client_fd = session.clients.items[client_index].fd;
-            const frame = readWebsocketFrame(alloc, client_fd) catch {
+            const frame = readWebsocketFrame(alloc, &protocol_binlog, client_fd) catch {
                 const was_writer = session.clients.items[client_index].role == .writer;
                 closeClient(session, client_index);
-                if (was_writer) broadcastRoles(alloc, session);
+                if (was_writer) broadcastRoles(alloc, &protocol_binlog, session);
                 continue;
             };
             const payload = frame orelse {
@@ -1455,8 +1026,8 @@ pub fn main() !void {
                 .claim_writer => |claim| {
                     if (claim.terminal_id == session.id) {
                         claimWriter(session, client_index);
-                        broadcastRoles(alloc, session);
-                        broadcastTerminals(alloc, &terminals);
+                        broadcastRoles(alloc, &protocol_binlog, session);
+                        broadcastTerminals(alloc, &protocol_binlog, &terminals);
                     }
                 },
                 .input => |input| {
@@ -1481,11 +1052,11 @@ pub fn main() !void {
                             .down => @as(isize, @intCast(scroll.rows)),
                         };
                         session.terminal.screens.active.scroll(.{ .delta_row = delta });
-                        try broadcastSnapshot(alloc, session);
+                        try broadcastSnapshot(alloc, &protocol_binlog, session);
                     }
                 },
                 .list_terminals => {
-                    sendTerminals(alloc, client_fd, &terminals) catch {};
+                    sendTerminals(alloc, &protocol_binlog, client_fd, &terminals) catch {};
                 },
                 .create_terminal => |size| {
                     if (terminals.items.len < MAX_TERMINALS) {
@@ -1494,8 +1065,8 @@ pub fn main() !void {
                         try terminals.append(created);
                         const created_payload = try encodeTerminalCreated(alloc, created);
                         defer alloc.free(created_payload);
-                        sendWebsocket(client_fd, created_payload) catch {};
-                        broadcastTerminals(alloc, &terminals);
+                        sendWebsocket(&protocol_binlog, client_fd, created_payload) catch {};
+                        broadcastTerminals(alloc, &protocol_binlog, &terminals);
                     }
                 },
                 .close_terminal => |close| {
@@ -1505,7 +1076,7 @@ pub fn main() !void {
                                 if (candidate == target) {
                                     _ = terminals.swapRemove(terminal_index);
                                     target.deinit(alloc);
-                                    broadcastTerminals(alloc, &terminals);
+                                    broadcastTerminals(alloc, &protocol_binlog, &terminals);
                                     break;
                                 }
                             }
@@ -1519,73 +1090,11 @@ pub fn main() !void {
 
         for (terminals.items) |session| {
             if (session.pending_snapshot and std.time.milliTimestamp() - session.last_pty_output_ms >= SNAPSHOT_COALESCE_MS) {
-                try broadcastSnapshot(alloc, session);
+                try broadcastSnapshot(alloc, &protocol_binlog, session);
                 session.pending_snapshot = false;
             }
         }
     }
-}
-
-test "unstyled cells do not inherit styled foregrounds" {
-    const alloc = std.testing.allocator;
-
-    var terminal: vt.Terminal = try .init(alloc, .{ .cols = 40, .rows = 4 });
-    defer terminal.deinit(alloc);
-
-    var stream = terminal.vtStream();
-    defer stream.deinit();
-    try stream.nextSlice("plain \x1b[34mblue\x1b[0m plain");
-
-    var render: vt.RenderState = .empty;
-    defer render.deinit(alloc);
-    const snap = try snapshot(alloc, &terminal, &render);
-    defer alloc.free(snap.cells);
-
-    try std.testing.expectEqual(@as(?u24, null), snap.cells[0].fg_rgb);
-    try std.testing.expect(snap.cells[6].fg_rgb != null);
-    try std.testing.expectEqual(@as(?u24, null), snap.cells[11].fg_rgb);
-}
-
-test "color-only cells preserve background colors" {
-    const alloc = std.testing.allocator;
-
-    var terminal: vt.Terminal = try .init(alloc, .{ .cols = 8, .rows = 3 });
-    defer terminal.deinit(alloc);
-
-    var stream = terminal.vtStream();
-    defer stream.deinit();
-    try stream.nextSlice("\x1b[42m        \x1b[0m");
-
-    var render: vt.RenderState = .empty;
-    defer render.deinit(alloc);
-    const snap = try snapshot(alloc, &terminal, &render);
-    defer alloc.free(snap.cells);
-
-    try std.testing.expect(snap.cells[0].bg_rgb != null);
-    try std.testing.expectEqual(@as(?u24, null), snap.cells[0].fg_rgb);
-}
-
-test "decodes compact client protocol messages" {
-    const input = [_]u8{ 0x93, 0x01, 0x2a, 0xa1, 'x' };
-    const msg = try decodeClientMessage(&input);
-    try std.testing.expectEqual(@as(u32, 42), msg.input.terminal_id);
-    try std.testing.expectEqualStrings("x", msg.input.data);
-
-    const resize = [_]u8{ 0x94, 0x02, 0x2a, 0xcc, 120, 0x28 };
-    const resize_msg = try decodeClientMessage(&resize);
-    try std.testing.expectEqual(@as(u32, 42), resize_msg.resize.terminal_id);
-    try std.testing.expectEqual(@as(u16, 120), resize_msg.resize.cols);
-    try std.testing.expectEqual(@as(u16, 40), resize_msg.resize.rows);
-
-    const claim = [_]u8{ 0x92, 0x03, 0x2a };
-    const claim_msg = try decodeClientMessage(&claim);
-    try std.testing.expectEqual(@as(u32, 42), claim_msg.claim_writer.terminal_id);
-
-    const scroll = [_]u8{ 0x94, 0x04, 0x2a, 0x03, 0x00 };
-    const scroll_msg = try decodeClientMessage(&scroll);
-    try std.testing.expectEqual(@as(u32, 42), scroll_msg.scroll.terminal_id);
-    try std.testing.expectEqual(@as(u16, 3), scroll_msg.scroll.rows);
-    try std.testing.expectEqual(ScrollDirection.up, scroll_msg.scroll.direction);
 }
 
 test "terminal REST content format uses extension before accept header" {
@@ -1609,30 +1118,42 @@ test "terminal websocket path carries terminal id" {
     try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/terminal/nope.ws"));
 }
 
-test "terminal REST renderers emit text and escaped html" {
+test "protocol binlog writes binary framed payloads" {
     const alloc = std.testing.allocator;
-    var cells = [_]Cell{
-        .{ .char = 'o' },
-        .{ .char = 'k' },
-        .{ .char = '<', .fg_rgb = 0xff0000, .flags = 0x01 },
-        .{ .char = ' ' },
-    };
-    const snap: Snapshot = .{
-        .cols = 4,
-        .rows = 1,
-        .cursor_row = 0,
-        .cursor_col = 0,
-        .cursor_visible = false,
-        .mouse_reporting = false,
-        .cells = &cells,
-    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const text = try snapshotText(alloc, snap);
-    defer alloc.free(text);
-    try std.testing.expectEqualStrings("ok<", text);
+    const path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(path);
+    const file_path = try std.fs.path.join(alloc, &.{ path, "protocol.binlog" });
+    defer alloc.free(file_path);
 
-    const html = try snapshotHtml(alloc, 2, snap);
-    defer alloc.free(html);
-    try std.testing.expect(std.mem.indexOf(u8, html, "ghostd terminal 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "ok<span style=\"color:#ff0000;font-weight:700;\">&lt;</span>") != null);
+    var logger = try ProtocolBinlog.open(file_path);
+    defer logger.close();
+    try logger.write(.in, 42, &.{ 0x93, 0x01, 0x00 });
+    try logger.write(.out, 42, &.{ 0x92, 0x03 });
+    logger.close();
+
+    const contents = try std.fs.cwd().readFileAlloc(alloc, file_path, 1024);
+    defer alloc.free(contents);
+
+    try std.testing.expect(std.mem.startsWith(u8, contents, PROTOCOL_BINLOG_MAGIC));
+    var offset: usize = PROTOCOL_BINLOG_MAGIC.len;
+    try std.testing.expectEqual(@as(u8, 0), contents[offset]);
+    try std.testing.expectEqual(@as(u32, 42), readU32Le(contents[offset + 1 .. offset + 5]));
+    try std.testing.expectEqual(@as(u32, 3), readU32Le(contents[offset + 13 .. offset + 17]));
+    try std.testing.expectEqualSlices(u8, &.{ 0x93, 0x01, 0x00 }, contents[offset + 17 .. offset + 20]);
+
+    offset += 20;
+    try std.testing.expectEqual(@as(u8, 1), contents[offset]);
+    try std.testing.expectEqual(@as(u32, 42), readU32Le(contents[offset + 1 .. offset + 5]));
+    try std.testing.expectEqual(@as(u32, 2), readU32Le(contents[offset + 13 .. offset + 17]));
+    try std.testing.expectEqualSlices(u8, &.{ 0x92, 0x03 }, contents[offset + 17 .. offset + 19]);
+    try std.testing.expectEqual(offset + 19, contents.len);
+}
+
+fn readU32Le(bytes: []const u8) u32 {
+    var fixed: [4]u8 = undefined;
+    @memcpy(&fixed, bytes[0..4]);
+    return std.mem.readInt(u32, &fixed, .little);
 }

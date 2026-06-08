@@ -8,6 +8,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import type {
   ClientMessage,
   ClientRole,
+  CellRange,
   PackedRow,
   ServerMessage,
   TerminalId,
@@ -216,7 +217,7 @@ export class RemoteTerminalCore implements TerminalCore {
 
     if (message.type === "rows") {
       this.cursor = message.cursor;
-      this.applyRows(message.rows);
+      this.applyRanges(message.ranges);
       return;
     }
 
@@ -246,6 +247,24 @@ export class RemoteTerminalCore implements TerminalCore {
       if (this.rowsEqual(this.viewport[row.index], row.cells)) continue;
       this.viewport[row.index] = row.cells;
       this.dirtyRows.add(row.index);
+    }
+  }
+
+  private applyRanges(ranges: CellRange[]): void {
+    for (const range of ranges) {
+      if (range.row < 0 || range.row >= this.rows) continue;
+      const row = this.viewport[range.row] ?? this.blankRow();
+      let changed = false;
+      for (let i = 0; i < range.cells.length; i++) {
+        const col = range.col + i;
+        if (col < 0 || col >= this.cols) continue;
+        if (this.cellsEqual(row[col], range.cells[i])) continue;
+        row[col] = range.cells[i];
+        changed = true;
+      }
+      if (!changed) continue;
+      this.viewport[range.row] = row;
+      this.dirtyRows.add(range.row);
     }
   }
 

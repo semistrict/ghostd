@@ -28,7 +28,6 @@ export class GhostdWebTerminal {
   private renderer: Renderer | null = null;
   private input: InputHandler | null = null;
   private rafId: number | null = null;
-  private _renderTimer: ReturnType<typeof setTimeout> | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private _destroyed = false;
   private _shouldScrollToBottom = false;
@@ -160,16 +159,11 @@ export class GhostdWebTerminal {
   }
 
   private _scheduleRender(): void {
-    if (this._renderTimer != null) return;
-    this._renderTimer = setTimeout(() => {
-      this._renderTimer = null;
-      if (this.rafId == null) {
-        this.rafId = requestAnimationFrame(() => {
-          this.rafId = null;
-          this._doRender();
-        });
-      }
-    }, 0);
+    if (this.rafId != null) return;
+    this.rafId = requestAnimationFrame(() => {
+      this.rafId = null;
+      this._doRender();
+    });
   }
 
   private _initialRender(): void {
@@ -279,7 +273,6 @@ export class GhostdWebTerminal {
 
   destroy(): void {
     this._destroyed = true;
-    if (this._renderTimer != null) clearTimeout(this._renderTimer);
     if (this.rafId != null) cancelAnimationFrame(this.rafId);
     if (this.resizeObserver) this.resizeObserver.disconnect();
     if (this.input) this.input.destroy();
