@@ -530,6 +530,42 @@ fn requestBody(request: []const u8) []const u8 {
     return request[body_start..];
 }
 
+fn contentLength(request: []const u8) ?usize {
+    const value = findHeader(request, "Content-Length") orelse return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+fn readAllFd(fd: c_int, buffer: []u8) !void {
+    var off: usize = 0;
+    while (off < buffer.len) {
+        const n = c.read(fd, buffer.ptr + off, buffer.len - off);
+        if (n < 0) {
+            if (std.posix.errno(-1) == .INTR) continue;
+            if (std.posix.errno(-1) == .AGAIN) {
+                var pfd: c.struct_pollfd = .{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+                const ready = c.poll(&pfd, 1, 1000);
+                if (ready > 0) continue;
+                return error.ReadTimedOut;
+            }
+            return error.ReadFailed;
+        }
+        if (n == 0) return error.ReadFailed;
+        off += @intCast(n);
+    }
+}
+
+fn readRequestBody(alloc: std.mem.Allocator, fd: c_int, request: []const u8) ![]u8 {
+    const existing = requestBody(request);
+    const expected_len = contentLength(request) orelse return alloc.dupe(u8, existing);
+    if (expected_len <= existing.len) return alloc.dupe(u8, existing[0..expected_len]);
+
+    const body = try alloc.alloc(u8, expected_len);
+    errdefer alloc.free(body);
+    @memcpy(body[0..existing.len], existing);
+    try readAllFd(fd, body[existing.len..]);
+    return body;
+}
+
 fn queryParamU32(request: []const u8, name: []const u8) ?u32 {
     const target = requestTarget(request);
     const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return null;
@@ -916,7 +952,8 @@ fn handlePostedInput(
         try sendHttp(fd, "404 Not Found", "client not found\n");
         return true;
     };
-    const body = requestBody(request);
+    const body = try readRequestBody(alloc, fd, request);
+    defer alloc.free(body);
     try logger.write(.in, fd, body);
     const msg = decodeClientMessage(body) catch .unknown;
     try processClientMessage(alloc, logger, terminals, next_terminal_id, session, client_index, msg);
