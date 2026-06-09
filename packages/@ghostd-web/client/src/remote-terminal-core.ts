@@ -64,6 +64,9 @@ export class RemoteTerminalCore implements TerminalCore {
   private reconnect = true;
   private connectedUrl: string | null = null;
   private inputUrl: string | null = null;
+  private inputQueue: Promise<void> = Promise.resolve();
+  private pendingInput = "";
+  private pendingInputTimer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Map<keyof RemoteTerminalCoreEventMap, Set<(value: never) => void>>();
 
   onUpdate: (() => void) | null = null;
@@ -438,6 +441,19 @@ export class RemoteTerminalCore implements TerminalCore {
 
   private sendInput(data: string): void {
     if (this.role !== "writer") return;
+    if (this.transport === "event-stream") {
+      this.pendingInput += data;
+      if (this.pendingInputTimer) return;
+      this.pendingInputTimer = setTimeout(() => {
+        this.pendingInputTimer = null;
+        const pendingInput = this.pendingInput;
+        this.pendingInput = "";
+        if (pendingInput) {
+          this.send({ type: "input", terminalId: this.terminalId, data: pendingInput });
+        }
+      }, 10);
+      return;
+    }
     this.send({ type: "input", terminalId: this.terminalId, data });
   }
 
@@ -445,11 +461,13 @@ export class RemoteTerminalCore implements TerminalCore {
     const bytes = encode(encodeClientMessage(message));
     if (this.transport === "event-stream") {
       if (!this.inputUrl) return;
-      void fetch(this.inputUrl, {
+      this.inputQueue = this.inputQueue
+        .then(() => fetch(this.inputUrl!, {
         body: bytes,
         headers: { "Content-Type": "application/octet-stream" },
         method: "POST",
-      });
+        }))
+        .then(() => undefined, () => undefined);
       return;
     }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
