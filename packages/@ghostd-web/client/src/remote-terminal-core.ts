@@ -443,18 +443,29 @@ export class RemoteTerminalCore implements TerminalCore {
     if (this.role !== "writer") return;
     if (this.transport === "event-stream") {
       this.pendingInput += data;
-      if (this.pendingInputTimer) return;
-      this.pendingInputTimer = setTimeout(() => {
+      if (this.pendingInputTimer) {
+        clearTimeout(this.pendingInputTimer);
         this.pendingInputTimer = null;
-        const pendingInput = this.pendingInput;
-        this.pendingInput = "";
-        if (pendingInput) {
-          this.send({ type: "input", terminalId: this.terminalId, data: pendingInput });
-        }
-      }, 10);
+      }
+      if (data.includes("\r") || data.includes("\n")) {
+        this.flushPendingInput();
+      } else {
+        this.pendingInputTimer = setTimeout(() => this.flushPendingInput(), 50);
+      }
       return;
     }
     this.send({ type: "input", terminalId: this.terminalId, data });
+  }
+
+  private flushPendingInput(): void {
+    if (this.pendingInputTimer) {
+      clearTimeout(this.pendingInputTimer);
+      this.pendingInputTimer = null;
+    }
+    const pendingInput = this.pendingInput;
+    this.pendingInput = "";
+    if (!pendingInput) return;
+    this.send({ type: "input", terminalId: this.terminalId, data: pendingInput });
   }
 
   private send(message: ClientMessage): void {
