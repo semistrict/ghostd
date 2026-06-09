@@ -64,9 +64,8 @@ export class RemoteTerminalCore implements TerminalCore {
   private reconnect = true;
   private connectedUrl: string | null = null;
   private inputUrl: string | null = null;
-  private inputQueue: Promise<void> = Promise.resolve();
+  private inputPostInFlight = false;
   private pendingInput = "";
-  private pendingInputTimer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Map<keyof RemoteTerminalCoreEventMap, Set<(value: never) => void>>();
 
   onUpdate: (() => void) | null = null;
@@ -138,6 +137,8 @@ export class RemoteTerminalCore implements TerminalCore {
 
   disconnect(): void {
     this.connectedUrl = null;
+    this.inputPostInFlight = false;
+    this.pendingInput = "";
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -442,43 +443,43 @@ export class RemoteTerminalCore implements TerminalCore {
   private sendInput(data: string): void {
     if (this.role !== "writer") return;
     if (this.transport === "event-stream") {
-      this.pendingInput += data;
-      if (this.pendingInputTimer) {
-        clearTimeout(this.pendingInputTimer);
-        this.pendingInputTimer = null;
-      }
-      if (data.includes("\r") || data.includes("\n")) {
-        this.flushPendingInput();
-      } else {
-        this.pendingInputTimer = setTimeout(() => this.flushPendingInput(), 50);
-      }
+      if (this.inputPostInFlight) this.pendingInput += data;
+      else this.sendEventStreamInput(data);
       return;
     }
     this.send({ type: "input", terminalId: this.terminalId, data });
   }
 
-  private flushPendingInput(): void {
-    if (this.pendingInputTimer) {
-      clearTimeout(this.pendingInputTimer);
-      this.pendingInputTimer = null;
-    }
-    const pendingInput = this.pendingInput;
-    this.pendingInput = "";
-    if (!pendingInput) return;
-    this.send({ type: "input", terminalId: this.terminalId, data: pendingInput });
+  private sendEventStreamInput(data: string): void {
+    if (!data || !this.inputUrl) return;
+    this.inputPostInFlight = true;
+    const message = { type: "input", terminalId: this.terminalId, data } as const;
+    const bytes = encode(encodeClientMessage(message));
+    this.postEventStreamMessage(bytes).finally(() => {
+      const pendingInput = this.pendingInput;
+      this.pendingInput = "";
+      if (pendingInput) {
+        this.sendEventStreamInput(pendingInput);
+      } else {
+        this.inputPostInFlight = false;
+      }
+    });
+  }
+
+  private async postEventStreamMessage(bytes: Uint8Array): Promise<void> {
+    if (!this.inputUrl) return;
+    const body = new Uint8Array(bytes).buffer;
+    await fetch(this.inputUrl, {
+      body,
+      headers: { "Content-Type": "application/octet-stream" },
+      method: "POST",
+    });
   }
 
   private send(message: ClientMessage): void {
     const bytes = encode(encodeClientMessage(message));
     if (this.transport === "event-stream") {
-      if (!this.inputUrl) return;
-      this.inputQueue = this.inputQueue
-        .then(() => fetch(this.inputUrl!, {
-        body: bytes,
-        headers: { "Content-Type": "application/octet-stream" },
-        method: "POST",
-        }))
-        .then(() => undefined, () => undefined);
+      void this.postEventStreamMessage(bytes).catch(() => undefined);
       return;
     }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
