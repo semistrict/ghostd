@@ -25,6 +25,13 @@ const BLANK_CELL: CellData = {
   flags: 0,
 };
 
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 export type RemoteTerminalCoreEventMap = {
   open: Event;
   close: CloseEvent;
@@ -36,6 +43,8 @@ export type RemoteTerminalCoreEventMap = {
   terminalClosed: TerminalId;
 };
 
+export type RemoteTerminalTransport = "websocket" | "event-stream";
+
 export class RemoteTerminalCore implements TerminalCore {
   private terminalId: TerminalId = 0;
   private cols = 80;
@@ -46,12 +55,15 @@ export class RemoteTerminalCore implements TerminalCore {
   private dirtyRows = new Set<number>();
   private cursor: CursorState = { row: 0, col: 0, visible: true };
   private ws: WebSocket | null = null;
+  private eventSource: EventSource | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private transport: RemoteTerminalTransport = "websocket";
   private role: ClientRole = "reader";
   private forceNextResize = false;
   private mouseReporting = false;
   private reconnect = true;
   private connectedUrl: string | null = null;
+  private inputUrl: string | null = null;
   private listeners = new Map<keyof RemoteTerminalCoreEventMap, Set<(value: never) => void>>();
 
   onUpdate: (() => void) | null = null;
@@ -104,11 +116,21 @@ export class RemoteTerminalCore implements TerminalCore {
     this.send({ type: "resize", terminalId: this.terminalId, cols, rows });
   }
 
-  connect(url: string, options: { reconnect?: boolean } = {}): void {
+  connect(
+    url: string,
+    options: {
+      inputUrl?: string;
+      reconnect?: boolean;
+      transport?: RemoteTerminalTransport;
+    } = {},
+  ): void {
     this.disconnect();
     this.connectedUrl = url;
+    this.inputUrl = options.inputUrl ?? null;
     this.reconnect = options.reconnect ?? true;
-    this.openSocket(url);
+    this.transport = options.transport ?? "websocket";
+    if (this.transport === "event-stream") this.openEventStream(url);
+    else this.openSocket(url);
   }
 
   disconnect(): void {
@@ -120,6 +142,9 @@ export class RemoteTerminalCore implements TerminalCore {
     const ws = this.ws;
     this.ws = null;
     ws?.close();
+    const eventSource = this.eventSource;
+    this.eventSource = null;
+    eventSource?.close();
   }
 
   getTerminalId(): TerminalId {
@@ -240,9 +265,7 @@ export class RemoteTerminalCore implements TerminalCore {
         event.data instanceof ArrayBuffer
           ? new Uint8Array(event.data)
           : new Uint8Array(event.data as ArrayBufferLike);
-      this.applyMessage(decodeServerMessage(decode(bytes)));
-      this.onUpdate?.();
-      this.emit("update", undefined);
+      this.applyWireBytes(bytes);
     };
 
     ws.onerror = (event) => {
@@ -260,6 +283,41 @@ export class RemoteTerminalCore implements TerminalCore {
         this.openSocket(this.connectedUrl);
       }, 1000);
     };
+  }
+
+  private openEventStream(url: string): void {
+    const eventSource = new EventSource(url);
+    this.eventSource = eventSource;
+
+    eventSource.onopen = (event) => {
+      if (this.eventSource !== eventSource) return;
+      this.emit("open", event);
+    };
+
+    eventSource.onmessage = (event) => {
+      if (this.eventSource !== eventSource) return;
+      this.applyWireBytes(base64ToBytes(event.data));
+    };
+
+    eventSource.onerror = (event) => {
+      if (this.eventSource !== eventSource) return;
+      this.emit("error", event);
+      if (eventSource.readyState === EventSource.CLOSED) {
+        this.eventSource = null;
+        this.emit("close", new CloseEvent("close"));
+        if (!this.reconnect || !this.connectedUrl) return;
+        this.reconnectTimer = setTimeout(() => {
+          if (!this.connectedUrl) return;
+          this.openEventStream(this.connectedUrl);
+        }, 1000);
+      }
+    };
+  }
+
+  private applyWireBytes(bytes: Uint8Array): void {
+    this.applyMessage(decodeServerMessage(decode(bytes)));
+    this.onUpdate?.();
+    this.emit("update", undefined);
   }
 
   private applyMessage(message: ServerMessage): void {
@@ -384,8 +442,18 @@ export class RemoteTerminalCore implements TerminalCore {
   }
 
   private send(message: ClientMessage): void {
+    const bytes = encode(encodeClientMessage(message));
+    if (this.transport === "event-stream") {
+      if (!this.inputUrl) return;
+      void fetch(this.inputUrl, {
+        body: bytes,
+        headers: { "Content-Type": "application/octet-stream" },
+        method: "POST",
+      });
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(encode(encodeClientMessage(message)));
+    this.ws.send(bytes);
   }
 
   private emit<K extends keyof RemoteTerminalCoreEventMap>(

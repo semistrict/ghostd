@@ -4,6 +4,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 type TraceEntry = Record<string, unknown> & { at: number; type: string };
+type TransportCase = {
+  name: "websocket" | "event-stream";
+  query: string;
+  outputPath: string;
+  inputType: "ws:send" | "fetch:request";
+  outputType: "ws:message" | "eventsource:message";
+};
 
 declare global {
   interface Window {
@@ -69,6 +76,57 @@ function installFrontendTrace(): void {
   Object.defineProperty(TracedWebSocket, "CLOSING", { value: OriginalWebSocket.CLOSING });
   Object.defineProperty(TracedWebSocket, "CLOSED", { value: OriginalWebSocket.CLOSED });
   window.WebSocket = TracedWebSocket as typeof WebSocket;
+
+  const OriginalEventSource = window.EventSource;
+  class TracedEventSource extends OriginalEventSource {
+    constructor(url: string | URL, eventSourceInitDict?: EventSourceInit) {
+      super(url, eventSourceInitDict);
+      push({ type: "eventsource:new", url: String(url) });
+
+      this.addEventListener("open", () =>
+        push({ type: "eventsource:open", url: String(url) }),
+      );
+      this.addEventListener("error", () => push({ type: "eventsource:error" }));
+      this.addEventListener("message", (event) => {
+        push({
+          type: "eventsource:message",
+          data: event.data,
+          byteLength: String(event.data).length,
+        });
+      });
+    }
+  }
+  Object.defineProperty(TracedEventSource, "CONNECTING", {
+    value: OriginalEventSource.CONNECTING,
+  });
+  Object.defineProperty(TracedEventSource, "OPEN", { value: OriginalEventSource.OPEN });
+  Object.defineProperty(TracedEventSource, "CLOSED", {
+    value: OriginalEventSource.CLOSED,
+  });
+  window.EventSource = TracedEventSource as typeof EventSource;
+
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    const body = init?.body ?? (input instanceof Request ? input.body : undefined);
+    const bytes = await bytesFromFetchBody(body);
+    push({
+      type: "fetch:request",
+      url,
+      method,
+      byteLength: bytes?.length ?? 0,
+      bytes: bytes ? Array.from(bytes) : undefined,
+    });
+    const response = await originalFetch(input, init);
+    push({
+      type: "fetch:response",
+      url: response.url || url,
+      method,
+      status: response.status,
+    });
+    return response;
+  }) as typeof window.fetch;
 
   const originalRaf = window.requestAnimationFrame.bind(window);
   window.requestAnimationFrame = (callback) => {
@@ -167,12 +225,23 @@ function installFrontendTrace(): void {
     if (typeof data === "string") return Promise.resolve(new TextEncoder().encode(data));
     return bytesFromMessage(data);
   }
+
+  async function bytesFromFetchBody(body: BodyInit | null | undefined): Promise<Uint8Array | null> {
+    if (!body) return null;
+    if (typeof body === "string") return new TextEncoder().encode(body);
+    if (body instanceof URLSearchParams) return new TextEncoder().encode(String(body));
+    if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
+    if (body instanceof FormData || body instanceof ReadableStream) return null;
+    return bytesFromMessage(body);
+  }
 }
 
 function decodeMessages(trace: TraceEntry[]): TraceEntry[] {
   return trace.map((entry) => {
     if (
-      (entry.type === "ws:message" || entry.type === "ws:send") &&
+      (entry.type === "ws:message" ||
+        entry.type === "ws:send" ||
+        entry.type === "fetch:request") &&
       Array.isArray(entry.bytes)
     ) {
       try {
@@ -182,13 +251,59 @@ function decodeMessages(trace: TraceEntry[]): TraceEntry[] {
         return { ...entry, decodeError: String(error) };
       }
     }
+    if (entry.type === "eventsource:message" && typeof entry.data === "string") {
+      try {
+        const decoded = decode(base64ToBytes(entry.data));
+        return { ...entry, decoded };
+      } catch (error) {
+        return { ...entry, decodeError: String(error) };
+      }
+    }
     return entry;
   });
 }
 
-async function setupTracedPage(page: import("@playwright/test").Page): Promise<void> {
+const transports: TransportCase[] = [
+  {
+    name: "websocket",
+    query: "",
+    outputPath: "/terminal/0.ws",
+    inputType: "ws:send",
+    outputType: "ws:message",
+  },
+  {
+    name: "event-stream",
+    query: "?transport=event-stream",
+    outputPath: "/terminal/0.events",
+    inputType: "fetch:request",
+    outputType: "eventsource:message",
+  },
+];
+
+function base64ToBytes(value: string): Uint8Array {
+  return Uint8Array.from(Buffer.from(value, "base64"));
+}
+
+function clientIdFromUrl(value: unknown): string | null {
+  try {
+    return new URL(String(value)).searchParams.get("client");
+  } catch {
+    return null;
+  }
+}
+
+function expectUuid(value: string | null): asserts value is string {
+  expect(value).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+  );
+}
+
+async function setupTracedPage(
+  page: import("@playwright/test").Page,
+  transport: TransportCase,
+): Promise<void> {
   await page.addInitScript(installFrontendTrace);
-  await page.goto("/");
+  await page.goto(`/${transport.query}`);
   await expect(page.locator("#terminal .term-row").first()).toContainText("%");
 }
 
@@ -281,6 +396,14 @@ async function terminalText(page: import("@playwright/test").Page): Promise<stri
   return page.locator("#terminal").textContent();
 }
 
+async function terminalTabIds(page: import("@playwright/test").Page): Promise<number[]> {
+  return page.locator("[data-terminal-tab]").evaluateAll((tabs) =>
+    tabs
+      .map((tab) => Number((tab as HTMLElement).dataset.terminalTab))
+      .filter((id) => Number.isFinite(id)),
+  );
+}
+
 function decodedData(entry: TraceEntry): unknown {
   if (Array.isArray(entry.decoded)) return entry.decoded[2];
   if (typeof entry.decoded !== "object" || entry.decoded === null) return null;
@@ -293,7 +416,7 @@ function resizeSendsAtOrAfter(trace: TraceEntry[], at: number | undefined): Trac
     (entry) =>
       at !== undefined &&
       entry.at >= at &&
-      entry.type === "ws:send" &&
+      (entry.type === "ws:send" || entry.type === "fetch:request") &&
       decodedType(entry) === "resize",
   );
 }
@@ -303,37 +426,47 @@ function nonBlankRows(rows: unknown): number {
   return rows.filter((row) => typeof row === "string" && row.trim().length > 0).length;
 }
 
-test("typing trace records frontend activity and all websocket messages", async ({
+for (const transport of transports) {
+test.describe(`${transport.name} transport`, () => {
+test("typing trace records frontend activity and all protocol messages", async ({
   page,
 }, testInfo) => {
   const consoleEntries = watchConsole(page);
-  await setupTracedPage(page);
+  await setupTracedPage(page, transport);
+  await expect(page.locator("#status")).toHaveText("writer");
 
   await page.locator("#terminal").click();
-  await page.keyboard.type("echo ghostd-flash-probe");
-  await page.keyboard.press("Enter");
+  await page.locator("#terminal").pressSequentially("echo ghostd-flash-probe");
+  await page.locator("#terminal").press("Enter");
   await page.waitForTimeout(1500);
 
   const trace = await collectTrace(
     page,
     testInfo,
     consoleEntries,
-    "ghostd-frontend-trace",
+    `ghostd-frontend-trace-${transport.name}`,
   );
 
-  const messages = trace.filter((entry) => entry.type === "ws:message");
-  const sends = trace.filter((entry) => entry.type === "ws:send");
+  const messages = trace.filter((entry) => entry.type === transport.outputType);
+  const sends = trace.filter(
+    (entry) =>
+      entry.type === transport.inputType &&
+      (entry.type !== "fetch:request" || String(entry.method) === "POST"),
+  );
   const mutations = trace.filter((entry) => entry.type === "dom:mutation");
-  const sockets = trace.filter((entry) => entry.type === "ws:new");
+  const connections = trace.filter(
+    (entry) => entry.type === "ws:new" || entry.type === "eventsource:new",
+  );
   const firstTypedInputAt = sends.find(
     (entry) => decodedType(entry) === "input" && decodedData(entry) === "e",
   )?.at;
+  expect(firstTypedInputAt, "trace should include printable input").not.toBeUndefined();
   const resizeAfterTyping = resizeSendsAtOrAfter(trace, firstTypedInputAt);
   const rangeMessagesAfterTyping = trace.filter(
     (entry) =>
       firstTypedInputAt !== undefined &&
       entry.at >= firstTypedInputAt &&
-      entry.type === "ws:message" &&
+      entry.type === transport.outputType &&
       decodedServerType(entry) === "rows",
   );
   const rangeLengths = rangeMessagesAfterTyping.flatMap((entry) => {
@@ -345,12 +478,15 @@ test("typing trace records frontend activity and all websocket messages", async 
       .map((range) => (Array.isArray(range[2]) ? range[2].length : 0));
   });
 
-  expect(messages.length, "server websocket messages").toBeGreaterThan(0);
-  expect(sends.length, "client websocket messages").toBeGreaterThan(0);
+  expect(messages.length, "server protocol messages").toBeGreaterThan(0);
+  expect(sends.length, "client protocol messages").toBeGreaterThan(0);
   expect(mutations.length, "terminal DOM mutations").toBeGreaterThan(0);
-  expect(sockets.some((entry) => String(entry.url).endsWith("/terminal/0.ws"))).toBe(
-    true,
-  );
+  expect(
+    connections.some((entry) => String(entry.url).includes(transport.outputPath)),
+  ).toBe(true);
+  expectUuid(clientIdFromUrl(connections.find((entry) =>
+    String(entry.url).includes(transport.outputPath),
+  )?.url));
   expect(resizeAfterTyping, "typing must not trigger resize churn").toHaveLength(0);
   expect(rangeLengths.length, "typing should receive cell-range updates").toBeGreaterThan(0);
   expect(
@@ -359,8 +495,58 @@ test("typing trace records frontend activity and all websocket messages", async 
   ).toBeLessThan(80);
 });
 
+test("reconnecting with the same client id preserves writer role", async ({ page }) => {
+  await setupTracedPage(page, transport);
+  await expect(page.locator("#status")).toHaveText("writer");
+
+  await expect
+    .poll(async () => {
+      const trace = await page.evaluate(() => window.__ghostdTrace);
+      return Boolean(trace
+        .filter((entry) => entry.type === "ws:new" || entry.type === "eventsource:new")
+        .find((entry) => String(entry.url).includes(transport.outputPath))?.url);
+    }, "initial transport connection")
+    .toBe(true);
+  const firstConnection = await page.evaluate((outputPath) => {
+    return window.__ghostdTrace
+      .filter((entry) => entry.type === "ws:new" || entry.type === "eventsource:new")
+      .find((entry) => String(entry.url).includes(outputPath))?.url ?? null;
+  }, transport.outputPath);
+  const clientId = clientIdFromUrl(firstConnection);
+  expectUuid(clientId);
+
+  await page.locator('[data-terminal-tab="0"]').click();
+  await expect(page.locator("#status")).toHaveText("writer");
+  await expect
+    .poll(async () => {
+      const trace = await page.evaluate(() => window.__ghostdTrace);
+      return trace.filter(
+        (entry) =>
+          (entry.type === "ws:new" || entry.type === "eventsource:new") &&
+          String(entry.url).includes(transport.outputPath) &&
+          clientIdFromUrl(entry.url) === clientId,
+      ).length;
+    }, "same client id should reconnect")
+    .toBeGreaterThanOrEqual(2);
+});
+
+test("space-only input moves the rendered cursor", async ({ page }) => {
+  await setupTracedPage(page, transport);
+  await expect(page.locator("#status")).toHaveText("writer");
+  await page.locator("#terminal").click();
+
+  const before = await page.locator("#terminal .term-cursor").boundingBox();
+  expect(before, "initial cursor box").not.toBeNull();
+
+  await page.keyboard.type("   ");
+  await expect.poll(async () => {
+    const after = await page.locator("#terminal .term-cursor").boundingBox();
+    return after && before ? after.x - before.x : 0;
+  }, "cursor should move after spaces").toBeGreaterThan(20);
+});
+
 test("writer terminal fills the available viewport height", async ({ page }) => {
-  await setupTracedPage(page);
+  await setupTracedPage(page, transport);
   await expect(page.locator("#status")).toHaveText("writer");
 
   const expectedRows = await page.evaluate(() => {
@@ -382,7 +568,7 @@ test("writer terminal fills the available viewport height", async ({ page }) => 
 test("REST terminal API returns terminal list plus text and html contents", async ({
   page,
 }) => {
-  await setupTracedPage(page);
+  await setupTracedPage(page, transport);
 
   await page.locator("#terminal").click();
   await page.keyboard.type("echo ghostd-rest-probe");
@@ -420,7 +606,7 @@ test("REST terminal API returns terminal list plus text and html contents", asyn
 });
 
 test("terminal title updates tab heading and REST metadata", async ({ page }) => {
-  await setupTracedPage(page);
+  await setupTracedPage(page, transport);
 
   await page.locator("#terminal").click();
   await page.keyboard.type("printf '\\033]0;ghostd-title-probe\\007'");
@@ -441,7 +627,7 @@ test("terminal title updates tab heading and REST metadata", async ({ page }) =>
 });
 
 test("terminal pwd updates tab heading and REST metadata", async ({ page }) => {
-  await setupTracedPage(page);
+  await setupTracedPage(page, transport);
 
   await page.locator("#terminal").click();
   await page.keyboard.type(
@@ -474,8 +660,8 @@ test("stealing writer keeps terminal visible and does not cause delayed resize c
   const readerPage = await browser.newPage();
   const writerConsole = watchConsole(writerPage);
   const readerConsole = watchConsole(readerPage);
-  await setupTracedPage(writerPage);
-  await setupTracedPage(readerPage);
+  await setupTracedPage(writerPage, transport);
+  await setupTracedPage(readerPage, transport);
 
   await expect(writerPage.locator("#status")).toHaveText("writer");
   await expect(readerPage.locator("#status")).toHaveText("reader");
@@ -493,23 +679,24 @@ test("stealing writer keeps terminal visible and does not cause delayed resize c
     readerPage,
     testInfo,
     readerConsole,
-    "ghostd-steal-writer-reader-trace",
+    `ghostd-steal-writer-reader-trace-${transport.name}`,
   );
   await collectTrace(
     writerPage,
     testInfo,
     writerConsole,
-    "ghostd-steal-writer-old-writer-trace",
+    `ghostd-steal-writer-old-writer-trace-${transport.name}`,
   );
 
   const firstTypedInputAt = readerTrace.find(
     (entry) =>
-      entry.type === "ws:send" &&
+      entry.type === transport.inputType &&
       decodedType(entry) === "input" &&
       decodedData(entry) === "e",
   )?.at;
   const claimWriterAt = readerTrace.find(
-    (entry) => entry.type === "ws:send" && decodedType(entry) === "claimWriter",
+    (entry) =>
+      entry.type === transport.inputType && decodedType(entry) === "claimWriter",
   )?.at;
   const resizeAfterTyping = resizeSendsAtOrAfter(readerTrace, firstTypedInputAt);
   const blankMutations = readerTrace.filter(
@@ -528,7 +715,7 @@ test("stealing writer keeps terminal visible and does not cause delayed resize c
 });
 
 test("tabbed terminals keep independent PTY state", async ({ page }) => {
-  await setupTracedPage(page);
+  await setupTracedPage(page, transport);
 
   await expect(page.locator('[data-terminal-tab="0"]')).toHaveAttribute(
     "aria-selected",
@@ -540,9 +727,19 @@ test("tabbed terminals keep independent PTY state", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page.locator("#terminal")).toContainText("ghostd-terminal-zero");
 
+  const beforeTabIds = new Set(await terminalTabIds(page));
   await page.locator("#new-terminal").click();
-  const tabOne = page.locator('[data-terminal-tab="1"]');
-  await expect(tabOne).toBeVisible();
+  await expect
+    .poll(async () => {
+      const ids = await terminalTabIds(page);
+      return ids.some((id) => !beforeTabIds.has(id));
+    }, "new terminal tab should appear")
+    .toBe(true);
+  const createdTerminalId = (await terminalTabIds(page)).find(
+    (id) => !beforeTabIds.has(id),
+  );
+  if (createdTerminalId === undefined) throw new Error("missing created terminal id");
+  const tabOne = page.locator(`[data-terminal-tab="${createdTerminalId}"]`);
   await expect(tabOne).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#terminal .term-row").first()).toContainText("%");
 
@@ -560,7 +757,9 @@ test("tabbed terminals keep independent PTY state", async ({ page }) => {
   await expect(page.locator("#terminal")).toContainText("ghostd-terminal-zero");
   expect(await terminalText(page)).not.toContain("ghostd-terminal-one");
 
-  await page.locator('[data-terminal-tab="1"]').click();
+  await page.locator(`[data-terminal-tab="${createdTerminalId}"]`).click();
   await expect(page.locator("#terminal")).toContainText("ghostd-terminal-one");
   expect(await terminalText(page)).not.toContain("ghostd-terminal-zero");
 });
+});
+}

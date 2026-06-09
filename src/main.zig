@@ -104,7 +104,20 @@ const Client = struct {
     fd: c_int,
     role: Role,
     terminal_id: u32,
+    transport: ClientTransport = .websocket,
+    client_id: ?ClientId = null,
 };
+
+const ClientTransport = enum {
+    websocket,
+    event_stream,
+};
+
+const ClientId = [36]u8;
+
+fn clientConnected(client: Client) bool {
+    return client.fd >= 0;
+}
 
 const TitleStream = vt.Stream(TitleStreamHandler);
 
@@ -149,6 +162,9 @@ const TerminalSession = struct {
     last_snapshot_cells: []Cell = &.{},
     last_snapshot_cols: u16 = 0,
     last_snapshot_rows: u16 = 0,
+    last_snapshot_cursor_row: u16 = 0,
+    last_snapshot_cursor_col: u16 = 0,
+    last_snapshot_cursor_visible: bool = false,
 
     fn create(alloc: std.mem.Allocator, id: u32, cols: u16, rows: u16) !*TerminalSession {
         const session = try alloc.create(TerminalSession);
@@ -175,12 +191,17 @@ const TerminalSession = struct {
         session.last_snapshot_cells = &.{};
         session.last_snapshot_cols = 0;
         session.last_snapshot_rows = 0;
+        session.last_snapshot_cursor_row = 0;
+        session.last_snapshot_cursor_col = 0;
+        session.last_snapshot_cursor_visible = false;
         session.pty_fd = try spawnPty(cols, rows);
         return session;
     }
 
     fn deinit(self: *TerminalSession, alloc: std.mem.Allocator) void {
-        for (self.clients.items) |client| _ = c.close(client.fd);
+        for (self.clients.items) |client| {
+            if (clientConnected(client)) _ = c.close(client.fd);
+        }
         self.clients.deinit();
         self.stream.deinit();
         self.render.deinit(alloc);
@@ -238,7 +259,7 @@ fn encodeTerminals(alloc: std.mem.Allocator, terminals: *std.array_list.Managed(
     for (terminals.items) |session| {
         var writer_connected = false;
         for (session.clients.items) |client| {
-            if (client.role == .writer) {
+            if (client.role == .writer and clientConnected(client)) {
                 writer_connected = true;
                 break;
             }
@@ -497,6 +518,63 @@ fn requestTarget(request: []const u8) []const u8 {
     return parts.next() orelse "/";
 }
 
+fn requestMethod(request: []const u8) []const u8 {
+    const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse request.len;
+    const first_line = request[0..first_line_end];
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    return parts.next() orelse "GET";
+}
+
+fn requestBody(request: []const u8) []const u8 {
+    const body_start = (std.mem.indexOf(u8, request, "\r\n\r\n") orelse return "") + 4;
+    return request[body_start..];
+}
+
+fn queryParamU32(request: []const u8, name: []const u8) ?u32 {
+    const target = requestTarget(request);
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var params = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+    while (params.next()) |param| {
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        if (!std.mem.eql(u8, param[0..eq], name)) continue;
+        return std.fmt.parseInt(u32, param[eq + 1 ..], 10) catch null;
+    }
+    return null;
+}
+
+fn queryParam(request: []const u8, name: []const u8) ?[]const u8 {
+    const target = requestTarget(request);
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var params = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+    while (params.next()) |param| {
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        if (!std.mem.eql(u8, param[0..eq], name)) continue;
+        return param[eq + 1 ..];
+    }
+    return null;
+}
+
+fn isUuidHex(byte: u8) bool {
+    return (byte >= '0' and byte <= '9') or
+        (byte >= 'a' and byte <= 'f') or
+        (byte >= 'A' and byte <= 'F');
+}
+
+fn parseClientId(value: []const u8) ?ClientId {
+    if (value.len != 36) return null;
+    var id: ClientId = undefined;
+    for (value, 0..) |byte, index| {
+        const is_hyphen_slot = index == 8 or index == 13 or index == 18 or index == 23;
+        if (is_hyphen_slot) {
+            if (byte != '-') return null;
+        } else if (!isUuidHex(byte)) {
+            return null;
+        }
+        id[index] = std.ascii.toLower(byte);
+    }
+    return id;
+}
+
 fn requestWantsWriter(request: []const u8) bool {
     const target = requestTarget(request);
     const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return false;
@@ -546,6 +624,26 @@ fn terminalIdFromWebsocketPath(path: []const u8) ?u32 {
     return std.fmt.parseInt(u32, id_part, 10) catch null;
 }
 
+fn terminalIdFromEventsPath(path: []const u8) ?u32 {
+    const prefix = "/terminal/";
+    const suffix = ".events";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (!std.mem.endsWith(u8, path, suffix)) return null;
+    const id_part = path[prefix.len .. path.len - suffix.len];
+    if (id_part.len == 0) return null;
+    return std.fmt.parseInt(u32, id_part, 10) catch null;
+}
+
+fn terminalIdFromInputPath(path: []const u8) ?u32 {
+    const prefix = "/terminal/";
+    const suffix = ".input";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (!std.mem.endsWith(u8, path, suffix)) return null;
+    const id_part = path[prefix.len .. path.len - suffix.len];
+    if (id_part.len == 0) return null;
+    return std.fmt.parseInt(u32, id_part, 10) catch null;
+}
+
 fn pwdPathFromUrl(url: []const u8) []const u8 {
     const file_prefix = "file://";
     const kitty_prefix = "kitty-shell-cwd://";
@@ -568,7 +666,7 @@ fn sendTerminalsJson(alloc: std.mem.Allocator, fd: c_int, terminals: *std.array_
     for (terminals.items, 0..) |session, index| {
         var writer_connected = false;
         for (session.clients.items) |client| {
-            if (client.role == .writer) {
+            if (client.role == .writer and clientConnected(client)) {
                 writer_connected = true;
                 break;
             }
@@ -658,6 +756,15 @@ fn sendStatic(fd: c_int, request: []const u8) !void {
     try writeAllFd(fd, asset.body);
 }
 
+fn clientIdFromRequest(request: []const u8) ?ClientId {
+    return parseClientId(queryParam(request, "client") orelse return null);
+}
+
+fn requestHasInvalidClientId(request: []const u8) bool {
+    const value = queryParam(request, "client") orelse return false;
+    return parseClientId(value) == null;
+}
+
 fn findSession(terminals: *std.array_list.Managed(*TerminalSession), terminal_id: u32) ?*TerminalSession {
     for (terminals.items) |session| {
         if (session.id == terminal_id) return session;
@@ -665,10 +772,162 @@ fn findSession(terminals: *std.array_list.Managed(*TerminalSession), terminal_id
     return null;
 }
 
-fn sendTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
+fn findClientIndexById(session: *TerminalSession, client_id: ClientId) ?usize {
+    for (session.clients.items, 0..) |client, index| {
+        if (client.client_id) |candidate| {
+            if (std.mem.eql(u8, &candidate, &client_id)) return index;
+        }
+    }
+    return null;
+}
+
+fn connectedClientCount(session: *TerminalSession) usize {
+    var count: usize = 0;
+    for (session.clients.items) |client| {
+        if (clientConnected(client)) count += 1;
+    }
+    return count;
+}
+
+fn pruneDisconnectedClients(session: *TerminalSession) void {
+    var i: usize = 0;
+    while (i < session.clients.items.len) {
+        if (!clientConnected(session.clients.items[i])) {
+            i += 1;
+            continue;
+        }
+
+        var byte: [1]u8 = undefined;
+        const got = c.recv(session.clients.items[i].fd, &byte, byte.len, c.MSG_PEEK);
+        if (got == 0) {
+            closeClient(session, i);
+            continue;
+        }
+        if (got < 0) {
+            const err = std.posix.errno(-1);
+            if (err != .AGAIN) {
+                closeClient(session, i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn replaceClientConnection(session: *TerminalSession, index: usize, fd: c_int, transport: ClientTransport, role: Role, client_id: ClientId) void {
+    if (clientConnected(session.clients.items[index])) _ = c.close(session.clients.items[index].fd);
+    session.clients.items[index] = .{
+        .fd = fd,
+        .role = role,
+        .terminal_id = session.id,
+        .transport = transport,
+        .client_id = client_id,
+    };
+}
+
+fn sendEventStreamHeaders(fd: c_int) !void {
+    try writeAllFd(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n");
+}
+
+fn acceptEventStream(
+    alloc: std.mem.Allocator,
+    logger: *ProtocolBinlog,
+    fd: c_int,
+    request: []const u8,
+    terminals: *std.array_list.Managed(*TerminalSession),
+) !bool {
+    const terminal_id = terminalIdFromEventsPath(requestPath(request)) orelse return false;
+    const session = findSession(terminals, terminal_id) orelse {
+        try sendHttp(fd, "404 Not Found", "terminal not found\n");
+        return true;
+    };
+    const client_id = clientIdFromRequest(request) orelse {
+        try sendHttp(fd, "400 Bad Request", "missing or invalid client id\n");
+        return true;
+    };
+
+    try sendEventStreamHeaders(fd);
+    pruneDisconnectedClients(session);
+
+    const existing_client_index = findClientIndexById(session, client_id);
+    const role: Role = if (existing_client_index) |index|
+        session.clients.items[index].role
+    else if (connectedClientCount(session) == 0 or requestWantsWriter(request) or autoClaimWriterEnabled())
+        .writer
+    else
+        .reader;
+    if (role == .writer) {
+        for (session.clients.items) |*client| client.role = .reader;
+    }
+    const client_index = if (existing_client_index) |index| blk: {
+        replaceClientConnection(session, index, fd, .event_stream, role, client_id);
+        break :blk index;
+    } else blk: {
+        try session.clients.append(.{
+            .fd = fd,
+            .role = role,
+            .terminal_id = session.id,
+            .transport = .event_stream,
+            .client_id = client_id,
+        });
+        break :blk session.clients.items.len - 1;
+    };
+
+    const snap = try snapshot(alloc, &session.terminal, &session.render);
+    defer alloc.free(snap.cells);
+    const payload = try protocol.encodeSnapshot(alloc, session.id, snap, role.wire());
+    defer alloc.free(payload);
+    sendProtocolMessage(alloc, logger, session.clients.items[client_index], payload) catch {
+        closeClient(session, client_index);
+        return true;
+    };
+    if (session.last_snapshot_cells.len == 0) {
+        session.last_snapshot_cells = try alloc.dupe(Cell, snap.cells);
+        session.last_snapshot_cols = snap.cols;
+        session.last_snapshot_rows = snap.rows;
+        session.last_snapshot_cursor_row = snap.cursor_row;
+        session.last_snapshot_cursor_col = snap.cursor_col;
+        session.last_snapshot_cursor_visible = snap.cursor_visible;
+    }
+    sendTerminals(alloc, logger, session.clients.items[client_index], terminals) catch {};
+    return true;
+}
+
+fn handlePostedInput(
+    alloc: std.mem.Allocator,
+    logger: *ProtocolBinlog,
+    fd: c_int,
+    request: []const u8,
+    terminals: *std.array_list.Managed(*TerminalSession),
+    next_terminal_id: *u32,
+) !bool {
+    if (!std.mem.eql(u8, requestMethod(request), "POST")) return false;
+    const terminal_id = terminalIdFromInputPath(requestPath(request)) orelse return false;
+    defer _ = c.close(fd);
+    const session = findSession(terminals, terminal_id) orelse {
+        try sendHttp(fd, "404 Not Found", "terminal not found\n");
+        return true;
+    };
+    const client_id = clientIdFromRequest(request) orelse {
+        try sendHttp(fd, "400 Bad Request", "missing or invalid client id\n");
+        return true;
+    };
+    const client_index = findClientIndexById(session, client_id) orelse {
+        try sendHttp(fd, "404 Not Found", "client not found\n");
+        return true;
+    };
+    const body = requestBody(request);
+    try logger.write(.in, fd, body);
+    const msg = decodeClientMessage(body) catch .unknown;
+    try processClientMessage(alloc, logger, terminals, next_terminal_id, session, client_index, msg);
+    try sendHttpContent(fd, "204 No Content", "application/octet-stream", "");
+    return true;
+}
+
+fn sendTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, client: Client, terminals: *std.array_list.Managed(*TerminalSession)) !void {
     const payload = try encodeTerminals(alloc, terminals);
     defer alloc.free(payload);
-    try sendWebsocket(logger, fd, payload);
+    try sendProtocolMessage(alloc, logger, client, payload);
 }
 
 fn broadcastTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, terminals: *std.array_list.Managed(*TerminalSession)) void {
@@ -677,7 +936,11 @@ fn broadcastTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, termina
     for (terminals.items) |session| {
         var i: usize = 0;
         while (i < session.clients.items.len) {
-            sendWebsocket(logger, session.clients.items[i].fd, payload) catch {
+            if (!clientConnected(session.clients.items[i])) {
+                i += 1;
+                continue;
+            }
+            sendProtocolMessage(alloc, logger, session.clients.items[i], payload) catch {
                 closeClient(session, i);
                 continue;
             };
@@ -686,7 +949,13 @@ fn broadcastTerminals(alloc: std.mem.Allocator, logger: *ProtocolBinlog, termina
     }
 }
 
-fn acceptClient(alloc: std.mem.Allocator, logger: *ProtocolBinlog, listen_fd: c_int, terminals: *std.array_list.Managed(*TerminalSession)) !void {
+fn acceptClient(
+    alloc: std.mem.Allocator,
+    logger: *ProtocolBinlog,
+    listen_fd: c_int,
+    terminals: *std.array_list.Managed(*TerminalSession),
+    next_terminal_id: *u32,
+) !void {
     const fd = c.accept(listen_fd, null, null);
     if (fd < 0) return;
     errdefer _ = c.close(fd);
@@ -701,6 +970,8 @@ fn acceptClient(alloc: std.mem.Allocator, logger: *ProtocolBinlog, listen_fd: c_
     const n = c.read(fd, request_buf[0..].ptr, request_buf.len);
     if (n <= 0) return;
     const request = request_buf[0..@intCast(n)];
+    if (try handlePostedInput(alloc, logger, fd, request, terminals, next_terminal_id)) return;
+    if (try acceptEventStream(alloc, logger, fd, request, terminals)) return;
     const key = findHeader(request, "Sec-WebSocket-Key") orelse {
         if (try sendApi(alloc, fd, request, terminals)) return;
         try sendStatic(fd, request);
@@ -714,25 +985,42 @@ fn acceptClient(alloc: std.mem.Allocator, logger: *ProtocolBinlog, listen_fd: c_
         try sendHttp(fd, "404 Not Found", "terminal not found\n");
         return;
     };
+    if (requestHasInvalidClientId(request)) {
+        try sendHttp(fd, "400 Bad Request", "invalid client id\n");
+        return;
+    }
+    const client_id = clientIdFromRequest(request);
 
     const accept = try websocketAccept(alloc, key);
     defer alloc.free(accept);
     var response_buf: [512]u8 = undefined;
     const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
     try writeAllFd(fd, response);
+    pruneDisconnectedClients(session);
 
-    const role: Role = if (session.clients.items.len == 0 or requestWantsWriter(request) or autoClaimWriterEnabled()) .writer else .reader;
+    const existing_client_index = if (client_id) |id| findClientIndexById(session, id) else null;
+    const role: Role = if (existing_client_index) |index|
+        session.clients.items[index].role
+    else if (connectedClientCount(session) == 0 or requestWantsWriter(request) or autoClaimWriterEnabled())
+        .writer
+    else
+        .reader;
     if (role == .writer) {
         for (session.clients.items) |*client| client.role = .reader;
     }
-    try session.clients.append(.{ .fd = fd, .role = role, .terminal_id = session.id });
-    const client_index = session.clients.items.len - 1;
+    const client_index = if (existing_client_index) |index| blk: {
+        replaceClientConnection(session, index, fd, .websocket, role, client_id.?);
+        break :blk index;
+    } else blk: {
+        try session.clients.append(.{ .fd = fd, .role = role, .terminal_id = session.id, .transport = .websocket, .client_id = client_id });
+        break :blk session.clients.items.len - 1;
+    };
 
     const snap = try snapshot(alloc, &session.terminal, &session.render);
     defer alloc.free(snap.cells);
     const payload = try protocol.encodeSnapshot(alloc, session.id, snap, role.wire());
     defer alloc.free(payload);
-    sendWebsocket(logger, fd, payload) catch {
+    sendProtocolMessage(alloc, logger, session.clients.items[client_index], payload) catch {
         closeClient(session, client_index);
         return;
     };
@@ -740,8 +1028,11 @@ fn acceptClient(alloc: std.mem.Allocator, logger: *ProtocolBinlog, listen_fd: c_
         session.last_snapshot_cells = try alloc.dupe(Cell, snap.cells);
         session.last_snapshot_cols = snap.cols;
         session.last_snapshot_rows = snap.rows;
+        session.last_snapshot_cursor_row = snap.cursor_row;
+        session.last_snapshot_cursor_col = snap.cursor_col;
+        session.last_snapshot_cursor_visible = snap.cursor_visible;
     }
-    sendTerminals(alloc, logger, fd, terminals) catch {};
+    sendTerminals(alloc, logger, session.clients.items[client_index], terminals) catch {};
 }
 
 fn sendWebsocket(logger: *ProtocolBinlog, fd: c_int, payload: []const u8) !void {
@@ -765,6 +1056,26 @@ fn sendWebsocket(logger: *ProtocolBinlog, fd: c_int, payload: []const u8) !void 
     try logger.write(.out, fd, payload);
     try writeAllFd(fd, header[0..header_len]);
     try writeAllFd(fd, payload);
+}
+
+fn sendEventStream(alloc: std.mem.Allocator, logger: *ProtocolBinlog, fd: c_int, payload: []const u8) !void {
+    try logger.write(.out, fd, payload);
+    const encoded_len = std.base64.standard.Encoder.calcSize(payload.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, payload);
+    try writeAllFd(fd, "event: message\n");
+    try writeAllFd(fd, "data: ");
+    try writeAllFd(fd, encoded);
+    try writeAllFd(fd, "\n\n");
+}
+
+fn sendProtocolMessage(alloc: std.mem.Allocator, logger: *ProtocolBinlog, client: Client, payload: []const u8) !void {
+    if (!clientConnected(client)) return error.ClientDisconnected;
+    return switch (client.transport) {
+        .websocket => sendWebsocket(logger, client.fd, payload),
+        .event_stream => sendEventStream(alloc, logger, client.fd, payload),
+    };
 }
 
 fn readWebsocketFrame(alloc: std.mem.Allocator, logger: *ProtocolBinlog, fd: c_int) !?[]u8 {
@@ -811,9 +1122,17 @@ fn readWebsocketFrame(alloc: std.mem.Allocator, logger: *ProtocolBinlog, fd: c_i
 
 fn closeClient(session: *TerminalSession, index: usize) void {
     const was_writer = session.clients.items[index].role == .writer;
-    _ = c.close(session.clients.items[index].fd);
+    if (clientConnected(session.clients.items[index])) _ = c.close(session.clients.items[index].fd);
+    if (session.clients.items[index].client_id != null) {
+        session.clients.items[index].fd = -1;
+        return;
+    }
     _ = session.clients.swapRemove(index);
     if (was_writer and session.clients.items.len > 0) session.clients.items[0].role = .writer;
+}
+
+fn shouldBroadcastSnapshot(use_full_snapshot: bool, changed_range_count: usize, cursor_changed: bool) bool {
+    return use_full_snapshot or changed_range_count > 0 or cursor_changed;
 }
 
 fn broadcastSnapshot(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session: *TerminalSession) !void {
@@ -824,6 +1143,9 @@ fn broadcastSnapshot(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session:
         session.last_snapshot_rows != snap.rows or
         session.last_snapshot_cells.len != snap.cells.len;
     const use_full_snapshot = dimensions_changed or session.last_snapshot_cells.len == 0;
+    const cursor_changed = session.last_snapshot_cursor_row != snap.cursor_row or
+        session.last_snapshot_cursor_col != snap.cursor_col or
+        session.last_snapshot_cursor_visible != snap.cursor_visible;
 
     var changed_ranges = if (use_full_snapshot)
         std.array_list.Managed(CellRange).init(alloc)
@@ -831,18 +1153,22 @@ fn broadcastSnapshot(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session:
         try buildChangedRanges(alloc, session.last_snapshot_cells, snap.cells, snap.cols, snap.rows);
     defer changed_ranges.deinit();
 
-    if (!use_full_snapshot and changed_ranges.items.len == 0) {
+    if (!shouldBroadcastSnapshot(use_full_snapshot, changed_ranges.items.len, cursor_changed)) {
         return;
     }
 
     var i: usize = 0;
-    while (i < session.clients.items.len) {
-        const payload = if (use_full_snapshot)
-            try protocol.encodeSnapshot(alloc, session.id, snap, session.clients.items[i].role.wire())
-        else
+        while (i < session.clients.items.len) {
+            if (!clientConnected(session.clients.items[i])) {
+                i += 1;
+                continue;
+            }
+            const payload = if (use_full_snapshot)
+                try protocol.encodeSnapshot(alloc, session.id, snap, session.clients.items[i].role.wire())
+            else
             try encodeRows(alloc, session.id, snap, changed_ranges.items);
         defer alloc.free(payload);
-        sendWebsocket(logger, session.clients.items[i].fd, payload) catch {
+        sendProtocolMessage(alloc, logger, session.clients.items[i], payload) catch {
             closeClient(session, i);
             continue;
         };
@@ -857,14 +1183,21 @@ fn broadcastSnapshot(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session:
     }
     session.last_snapshot_cols = snap.cols;
     session.last_snapshot_rows = snap.rows;
+    session.last_snapshot_cursor_row = snap.cursor_row;
+    session.last_snapshot_cursor_col = snap.cursor_col;
+    session.last_snapshot_cursor_visible = snap.cursor_visible;
 }
 
 fn broadcastRoles(alloc: std.mem.Allocator, logger: *ProtocolBinlog, session: *TerminalSession) void {
     var i: usize = 0;
     while (i < session.clients.items.len) {
+        if (!clientConnected(session.clients.items[i])) {
+            i += 1;
+            continue;
+        }
         const payload = encodeRole(alloc, session.id, session.clients.items[i].role) catch return;
         defer alloc.free(payload);
-        sendWebsocket(logger, session.clients.items[i].fd, payload) catch {
+        sendProtocolMessage(alloc, logger, session.clients.items[i], payload) catch {
             closeClient(session, i);
             continue;
         };
@@ -876,6 +1209,81 @@ fn claimWriter(session: *TerminalSession, index: usize) void {
     if (index >= session.clients.items.len) return;
     for (session.clients.items) |*client| client.role = .reader;
     session.clients.items[index].role = .writer;
+}
+
+fn processClientMessage(
+    alloc: std.mem.Allocator,
+    logger: *ProtocolBinlog,
+    terminals: *std.array_list.Managed(*TerminalSession),
+    next_terminal_id: *u32,
+    session: *TerminalSession,
+    client_index: usize,
+    msg: ClientMessage,
+) !void {
+    switch (msg) {
+        .claim_writer => |claim| {
+            if (claim.terminal_id == session.id) {
+                claimWriter(session, client_index);
+                broadcastRoles(alloc, logger, session);
+                broadcastTerminals(alloc, logger, terminals);
+            }
+        },
+        .input => |input| {
+            if (input.terminal_id == session.id and session.clients.items[client_index].role == .writer) {
+                try writeAllFd(session.pty_fd, input.data);
+            }
+        },
+        .resize => |size| {
+            if (size.terminal_id == session.id and session.clients.items[client_index].role == .writer) {
+                try resizePty(session.pty_fd, size.cols, size.rows);
+                session.pending_resize = .{ .cols = size.cols, .rows = size.rows };
+            }
+        },
+        .scroll => |scroll| {
+            if (scroll.terminal_id == session.id and session.clients.items[client_index].role == .writer and !session.terminal.modes.get(.mouse_event_x10) and
+                !session.terminal.modes.get(.mouse_event_normal) and
+                !session.terminal.modes.get(.mouse_event_button) and
+                !session.terminal.modes.get(.mouse_event_any))
+            {
+                const delta: isize = switch (scroll.direction) {
+                    .up => -@as(isize, @intCast(scroll.rows)),
+                    .down => @as(isize, @intCast(scroll.rows)),
+                };
+                session.terminal.screens.active.scroll(.{ .delta_row = delta });
+                try broadcastSnapshot(alloc, logger, session);
+            }
+        },
+        .list_terminals => {
+            sendTerminals(alloc, logger, session.clients.items[client_index], terminals) catch {};
+        },
+        .create_terminal => |size| {
+            if (terminals.items.len < MAX_TERMINALS) {
+                const requesting_client = session.clients.items[client_index];
+                const created = try TerminalSession.create(alloc, next_terminal_id.*, size.cols, size.rows);
+                next_terminal_id.* += 1;
+                try terminals.append(created);
+                const created_payload = try encodeTerminalCreated(alloc, created);
+                defer alloc.free(created_payload);
+                sendProtocolMessage(alloc, logger, requesting_client, created_payload) catch {};
+                broadcastTerminals(alloc, logger, terminals);
+            }
+        },
+        .close_terminal => |close| {
+            if (close.terminal_id != DEFAULT_TERMINAL_ID) {
+                if (findSession(terminals, close.terminal_id)) |target| {
+                    for (terminals.items, 0..) |candidate, terminal_index| {
+                        if (candidate == target) {
+                            _ = terminals.swapRemove(terminal_index);
+                            target.deinit(alloc);
+                            broadcastTerminals(alloc, logger, terminals);
+                            break;
+                        }
+                    }
+                }
+            }
+        },
+        .unknown => {},
+    }
 }
 
 pub fn main() !void {
@@ -927,6 +1335,7 @@ pub fn main() !void {
         }
         for (terminals.items) |session| {
             for (session.clients.items, 0..) |client, client_index| {
+                if (!clientConnected(client)) continue;
                 if (client_count >= MAX_CLIENTS) break;
                 polled_client_sessions[client_count] = session;
                 polled_client_indexes[client_count] = client_index;
@@ -963,7 +1372,7 @@ pub fn main() !void {
         }
 
         if ((pollfds[0].revents & c.POLLIN) != 0) {
-            acceptClient(alloc, &protocol_binlog, listen_fd, &terminals) catch {};
+            acceptClient(alloc, &protocol_binlog, listen_fd, &terminals, &next_terminal_id) catch {};
         }
 
         for (polled_sessions[0..session_count], 0..) |session, session_index| {
@@ -999,6 +1408,10 @@ pub fn main() !void {
                 client_poll_index += 1;
                 continue;
             }
+            if (!clientConnected(session.clients.items[client_index])) {
+                client_poll_index += 1;
+                continue;
+            }
             if ((revents & (c.POLLIN | c.POLLHUP | c.POLLERR)) == 0) {
                 client_poll_index += 1;
                 continue;
@@ -1007,6 +1420,11 @@ pub fn main() !void {
                 const was_writer = session.clients.items[client_index].role == .writer;
                 closeClient(session, client_index);
                 if (was_writer) broadcastRoles(alloc, &protocol_binlog, session);
+                client_poll_index += 1;
+                continue;
+            }
+            if (session.clients.items[client_index].transport == .event_stream) {
+                client_poll_index += 1;
                 continue;
             }
             const client_fd = session.clients.items[client_index].fd;
@@ -1014,6 +1432,7 @@ pub fn main() !void {
                 const was_writer = session.clients.items[client_index].role == .writer;
                 closeClient(session, client_index);
                 if (was_writer) broadcastRoles(alloc, &protocol_binlog, session);
+                client_poll_index += 1;
                 continue;
             };
             const payload = frame orelse {
@@ -1022,69 +1441,7 @@ pub fn main() !void {
             };
             defer alloc.free(payload);
             const msg = decodeClientMessage(payload) catch .unknown;
-            switch (msg) {
-                .claim_writer => |claim| {
-                    if (claim.terminal_id == session.id) {
-                        claimWriter(session, client_index);
-                        broadcastRoles(alloc, &protocol_binlog, session);
-                        broadcastTerminals(alloc, &protocol_binlog, &terminals);
-                    }
-                },
-                .input => |input| {
-                    if (input.terminal_id == session.id and session.clients.items[client_index].role == .writer) {
-                        try writeAllFd(session.pty_fd, input.data);
-                    }
-                },
-                .resize => |size| {
-                    if (size.terminal_id == session.id and session.clients.items[client_index].role == .writer) {
-                        try resizePty(session.pty_fd, size.cols, size.rows);
-                        session.pending_resize = .{ .cols = size.cols, .rows = size.rows };
-                    }
-                },
-                .scroll => |scroll| {
-                    if (scroll.terminal_id == session.id and session.clients.items[client_index].role == .writer and !session.terminal.modes.get(.mouse_event_x10) and
-                        !session.terminal.modes.get(.mouse_event_normal) and
-                        !session.terminal.modes.get(.mouse_event_button) and
-                        !session.terminal.modes.get(.mouse_event_any))
-                    {
-                        const delta: isize = switch (scroll.direction) {
-                            .up => -@as(isize, @intCast(scroll.rows)),
-                            .down => @as(isize, @intCast(scroll.rows)),
-                        };
-                        session.terminal.screens.active.scroll(.{ .delta_row = delta });
-                        try broadcastSnapshot(alloc, &protocol_binlog, session);
-                    }
-                },
-                .list_terminals => {
-                    sendTerminals(alloc, &protocol_binlog, client_fd, &terminals) catch {};
-                },
-                .create_terminal => |size| {
-                    if (terminals.items.len < MAX_TERMINALS) {
-                        const created = try TerminalSession.create(alloc, next_terminal_id, size.cols, size.rows);
-                        next_terminal_id += 1;
-                        try terminals.append(created);
-                        const created_payload = try encodeTerminalCreated(alloc, created);
-                        defer alloc.free(created_payload);
-                        sendWebsocket(&protocol_binlog, client_fd, created_payload) catch {};
-                        broadcastTerminals(alloc, &protocol_binlog, &terminals);
-                    }
-                },
-                .close_terminal => |close| {
-                    if (close.terminal_id != DEFAULT_TERMINAL_ID) {
-                        if (findSession(&terminals, close.terminal_id)) |target| {
-                            for (terminals.items, 0..) |candidate, terminal_index| {
-                                if (candidate == target) {
-                                    _ = terminals.swapRemove(terminal_index);
-                                    target.deinit(alloc);
-                                    broadcastTerminals(alloc, &protocol_binlog, &terminals);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                },
-                .unknown => {},
-            }
+            try processClientMessage(alloc, &protocol_binlog, &terminals, &next_terminal_id, session, client_index, msg);
             client_poll_index += 1;
         }
 
@@ -1116,6 +1473,22 @@ test "terminal websocket path carries terminal id" {
     try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/api/terminal?id=42"));
     try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/terminal/42"));
     try std.testing.expectEqual(@as(?u32, null), terminalIdFromWebsocketPath("/terminal/nope.ws"));
+}
+
+test "client id query accepts canonical UUIDs" {
+    const request = "GET /terminal/0.ws?client=123E4567-e89B-12d3-A456-426614174000 HTTP/1.1\r\n\r\n";
+    const expected = "123e4567-e89b-12d3-a456-426614174000".*;
+    try std.testing.expectEqualSlices(u8, &expected, &(clientIdFromRequest(request) orelse unreachable));
+    try std.testing.expect(!requestHasInvalidClientId(request));
+    try std.testing.expect(requestHasInvalidClientId("GET /terminal/0.ws?client=not-a-uuid HTTP/1.1\r\n\r\n"));
+    try std.testing.expect(!requestHasInvalidClientId("GET /terminal/0.ws HTTP/1.1\r\n\r\n"));
+}
+
+test "snapshot broadcast includes cursor-only changes" {
+    try std.testing.expect(shouldBroadcastSnapshot(false, 0, true));
+    try std.testing.expect(shouldBroadcastSnapshot(false, 1, false));
+    try std.testing.expect(shouldBroadcastSnapshot(true, 0, false));
+    try std.testing.expect(!shouldBroadcastSnapshot(false, 0, false));
 }
 
 test "protocol binlog writes binary framed payloads" {

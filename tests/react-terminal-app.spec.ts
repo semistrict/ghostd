@@ -1,9 +1,15 @@
 import { expect, test } from "@playwright/test";
 
-test("React terminal app renders the real ghostd terminal chrome", async ({
+const transports = [
+  { name: "websocket", query: "" },
+  { name: "event-stream", query: "?transport=event-stream" },
+] as const;
+
+for (const transport of transports) {
+test(`${transport.name} React terminal app renders the real ghostd terminal chrome`, async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto(`/${transport.query}`);
 
   await expect(page.locator(".ghostd-react-shell")).toBeVisible();
   await expect(page.locator("#terminal .term-row").first()).toContainText("%");
@@ -19,3 +25,4 @@ test("React terminal app renders the real ghostd terminal chrome", async ({
   await expect(page.locator("#new-terminal")).toBeVisible();
   await expect(page.locator("#claim-writer")).toBeHidden();
 });
+}

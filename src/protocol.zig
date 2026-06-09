@@ -547,3 +547,25 @@ test "row range protocol encodes row column and cells" {
     };
     try std.testing.expectEqualSlices(u8, &expected, payload);
 }
+
+test "row range protocol can carry cursor-only updates" {
+    const alloc = std.testing.allocator;
+    var cells = [_]Cell{.{ .char = ' ' }};
+    const snap: Snapshot = .{
+        .cols = 1,
+        .rows = 1,
+        .cursor_row = 0,
+        .cursor_col = 1,
+        .cursor_visible = true,
+        .mouse_reporting = false,
+        .cells = &cells,
+    };
+
+    const payload = try encodeRows(alloc, 3, snap, &.{});
+    defer alloc.free(payload);
+
+    const expected = [_]u8{
+        0x94, 0x02, 0x03, 0x93, 0x00, 0x01, 0xc3, 0x90,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, payload);
+}

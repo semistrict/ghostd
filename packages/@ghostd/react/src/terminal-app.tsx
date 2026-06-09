@@ -1,7 +1,10 @@
 import {
+  ghostdTerminalEventSourceUrl,
+  ghostdTerminalInputUrl,
   ghostdTerminalWebSocketUrl,
   RemoteTerminalCore,
   type ClientRole,
+  type RemoteTerminalTransport,
   type TerminalId,
   type TerminalSummary,
 } from "@ghostd-web/client";
@@ -12,12 +15,14 @@ import "./styles.css";
 
 export interface GhostdTerminalAppProps {
   baseUrl?: string | URL;
+  authUrl?: string | URL;
   initialTerminalId?: TerminalId;
   cols?: number;
   rows?: number;
   className?: string;
   terminalClassName?: string;
   autoClaimWriter?: boolean;
+  transport?: RemoteTerminalTransport;
 }
 
 type ConnectionState = "connecting" | "open" | "closed" | "error";
@@ -60,6 +65,12 @@ function resolveBaseUrl(baseUrl: string | URL | undefined): URL {
   return new URL(".", window.location.href);
 }
 
+function resolveTransport(transport: RemoteTerminalTransport | undefined): RemoteTerminalTransport {
+  if (transport) return transport;
+  const params = new URLSearchParams(window.location.search);
+  return params.get("transport") === "event-stream" ? "event-stream" : "websocket";
+}
+
 function withWriterRequest(url: string, enabled: boolean): string {
   if (!enabled) return url;
   const next = new URL(url);
@@ -69,17 +80,20 @@ function withWriterRequest(url: string, enabled: boolean): string {
 
 export function GhostdTerminalApp({
   baseUrl,
+  authUrl,
   initialTerminalId = 0,
   cols = 80,
   rows = 24,
   className,
   terminalClassName,
   autoClaimWriter = false,
+  transport,
 }: GhostdTerminalAppProps) {
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const coreRef = useRef<RemoteTerminalCore | null>(null);
   const terminalRef = useRef<GhostdWebTerminal | null>(null);
   const activeTerminalIdRef = useRef<TerminalId>(initialTerminalId);
+  const clientIdsRef = useRef(new Map<TerminalId, string>());
   const pendingCreatedTerminalRef = useRef(false);
   const scrollToBottomOnUpdateRef = useRef(true);
   const sizeRef = useRef<SizeState>({
@@ -98,6 +112,16 @@ export function GhostdTerminalApp({
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("connecting");
   const baseUrlValue = String(baseUrl ?? ".");
+  const authUrlValue = authUrl ? String(authUrl) : "";
+  const transportValue = resolveTransport(transport);
+
+  function clientIdForTerminal(terminalId: TerminalId): string {
+    const existing = clientIdsRef.current.get(terminalId);
+    if (existing) return existing;
+    const clientId = crypto.randomUUID();
+    clientIdsRef.current.set(terminalId, clientId);
+    return clientId;
+  }
 
   function setCurrentTerminalId(terminalId: TerminalId): void {
     activeTerminalIdRef.current = terminalId;
@@ -134,6 +158,8 @@ export function GhostdTerminalApp({
     const base = resolveBaseUrl(baseUrlValue);
     const cleanupCallbacks: Array<() => void> = [];
     let resizeObserver: ResizeObserver | null = null;
+    let claimWriterAttempts = 0;
+    let claimWriterInterval: number | undefined;
 
     coreRef.current = core;
     terminalRef.current = terminal;
@@ -144,11 +170,29 @@ export function GhostdTerminalApp({
       renderedRows: rows,
     };
 
-    function terminalUrl(terminalId: TerminalId) {
-      return withWriterRequest(
-        ghostdTerminalWebSocketUrl(base, terminalId),
-        autoClaimWriter,
-      );
+    function terminalConnection(terminalId: TerminalId) {
+      const clientId = clientIdForTerminal(terminalId);
+      if (transportValue === "event-stream") {
+        return {
+          inputUrl: ghostdTerminalInputUrl(base, terminalId, clientId),
+          transport: transportValue,
+          url: withWriterRequest(
+            ghostdTerminalEventSourceUrl(base, terminalId, clientId),
+            autoClaimWriter,
+          ),
+        };
+      }
+      return {
+        transport: transportValue,
+        url: withWriterRequest(
+          ghostdTerminalWebSocketUrl(
+            base,
+            terminalId,
+            autoClaimWriter ? undefined : clientId,
+          ),
+          autoClaimWriter,
+        ),
+      };
     }
 
     function measureCellSize(): {
@@ -234,7 +278,35 @@ export function GhostdTerminalApp({
       setCurrentTerminalId(terminalId);
       setConnectionState("connecting");
       scrollToBottomOnUpdateRef.current = true;
-      core.connect(terminalUrl(terminalId));
+      const connection = terminalConnection(terminalId);
+      core.connect(connection.url, {
+        inputUrl: connection.inputUrl,
+        transport: connection.transport,
+      });
+    }
+
+    function scheduleClaimWriter(delayMs = 0): void {
+      if (!autoClaimWriter) return;
+      if (claimWriterAttempts >= 60) return;
+      claimWriterAttempts += 1;
+      window.setTimeout(() => {
+        if (!disposed && core.getRole() === "reader") core.claimWriter();
+      }, delayMs);
+    }
+
+    function startClaimWriterLoop(): void {
+      if (!autoClaimWriter || claimWriterInterval !== undefined) return;
+      claimWriterInterval = window.setInterval(() => {
+        if (disposed || core.getRole() === "writer" || claimWriterAttempts >= 60) {
+          if (claimWriterInterval !== undefined) {
+            window.clearInterval(claimWriterInterval);
+            claimWriterInterval = undefined;
+          }
+          return;
+        }
+
+        scheduleClaimWriter();
+      }, 1_000);
     }
 
     function sendWheelInput(event: WheelEvent): void {
@@ -295,6 +367,11 @@ export function GhostdTerminalApp({
       }
 
       terminal.write(new Uint8Array());
+      if (autoClaimWriter && core.getRole() === "reader") {
+        scheduleClaimWriter();
+        scheduleClaimWriter(250);
+        startClaimWriterLoop();
+      }
       if (scrollToBottomOnUpdateRef.current) {
         scrollToBottomOnUpdateRef.current = false;
         window.setTimeout(() => {
@@ -310,14 +387,15 @@ export function GhostdTerminalApp({
       terminalElement.classList.toggle("is-reader", nextRole === "reader");
       terminalElement.classList.toggle("is-writer", nextRole === "writer");
       if (autoClaimWriter && nextRole === "reader") {
-        window.setTimeout(() => {
-          if (!disposed && core.getRole() === "reader") core.claimWriter();
-        }, 0);
-        window.setTimeout(() => {
-          if (!disposed && core.getRole() === "reader") core.claimWriter();
-        }, 250);
+        scheduleClaimWriter();
+        scheduleClaimWriter(250);
+        startClaimWriterLoop();
       }
       if (nextRole === "writer") {
+        if (claimWriterInterval !== undefined) {
+          window.clearInterval(claimWriterInterval);
+          claimWriterInterval = undefined;
+        }
         terminal.focus();
         requestAnimationFrame(() => syncWriterSize({ force: true }));
       }
@@ -367,11 +445,41 @@ export function GhostdTerminalApp({
       }
     };
 
-    cleanupCallbacks.push(core.on("open", () => setConnectionState("open")));
+    cleanupCallbacks.push(
+      core.on("open", () => {
+        setConnectionState("open");
+        scheduleClaimWriter();
+        scheduleClaimWriter(250);
+        startClaimWriterLoop();
+      }),
+    );
     cleanupCallbacks.push(core.on("close", () => setConnectionState("closed")));
     cleanupCallbacks.push(core.on("error", () => setConnectionState("error")));
 
-    void terminal.init().then(() => {
+    function authenticate(): Promise<void> {
+      if (!authUrlValue) return Promise.resolve();
+
+      return new Promise((resolve) => {
+        const iframe = document.createElement("iframe");
+        const remove = () => iframe.remove();
+        const finish = () => {
+          remove();
+          resolve();
+        };
+
+        iframe.hidden = true;
+        iframe.referrerPolicy = "no-referrer";
+        iframe.src = new URL(authUrlValue, window.location.href).href;
+        iframe.addEventListener("load", finish, { once: true });
+        iframe.addEventListener("error", finish, { once: true });
+        window.setTimeout(finish, 5_000);
+        document.body.appendChild(iframe);
+      });
+    }
+
+    void terminal.init().then(async () => {
+      if (disposed) return;
+      await authenticate();
       if (disposed) return;
       resizeObserver = new ResizeObserver(() => syncWriterSize());
       resizeObserver.observe(terminalElement);
@@ -385,23 +493,46 @@ export function GhostdTerminalApp({
       disposed = true;
       terminalElement.removeEventListener("wheel", sendWheelInput);
       resizeObserver?.disconnect();
+      if (claimWriterInterval !== undefined) {
+        window.clearInterval(claimWriterInterval);
+      }
       cleanupCallbacks.forEach((cleanup) => cleanup());
       core.disconnect();
       terminal.destroy();
       if (coreRef.current === core) coreRef.current = null;
       if (terminalRef.current === terminal) terminalRef.current = null;
     };
-  }, [autoClaimWriter, baseUrlValue, cols, initialTerminalId, rows]);
+  }, [authUrlValue, autoClaimWriter, baseUrlValue, cols, initialTerminalId, rows, transportValue]);
 
   function handleSwitchTerminal(terminalId: TerminalId) {
     setCurrentTerminalId(terminalId);
     setConnectionState("connecting");
     scrollToBottomOnUpdateRef.current = true;
+    const base = resolveBaseUrl(baseUrlValue);
+    const clientId = clientIdForTerminal(terminalId);
+    if (transportValue === "event-stream") {
+      coreRef.current?.connect(
+        withWriterRequest(
+          ghostdTerminalEventSourceUrl(base, terminalId, clientId),
+          autoClaimWriter,
+        ),
+        {
+          inputUrl: ghostdTerminalInputUrl(base, terminalId, clientId),
+          transport: transportValue,
+        },
+      );
+      return;
+    }
     coreRef.current?.connect(
       withWriterRequest(
-        ghostdTerminalWebSocketUrl(resolveBaseUrl(baseUrlValue), terminalId),
+        ghostdTerminalWebSocketUrl(
+          base,
+          terminalId,
+          autoClaimWriter ? undefined : clientId,
+        ),
         autoClaimWriter,
       ),
+      { transport: transportValue },
     );
   }
 

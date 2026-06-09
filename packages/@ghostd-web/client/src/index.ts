@@ -1,6 +1,11 @@
 export { RemoteTerminalCore } from "./remote-terminal-core.js";
-export type { RemoteTerminalCoreEventMap } from "./remote-terminal-core.js";
+export type {
+  RemoteTerminalCoreEventMap,
+  RemoteTerminalTransport,
+} from "./remote-terminal-core.js";
 export {
+  ghostdTerminalEventSourceUrl,
+  ghostdTerminalInputUrl,
   ghostdTerminalWebSocketUrl,
   ghostdWebSocketBaseUrl,
 } from "./url.js";
